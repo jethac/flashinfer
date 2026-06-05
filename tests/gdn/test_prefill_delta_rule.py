@@ -46,6 +46,13 @@ def _skip_if_unsupported():
         pytest.skip("GDN prefill requires SM90, SM100, or SM120")
 
 
+def _skip_if_cp_unsupported():
+    """Skip test if context parallelism is unsupported."""
+    device = torch.device("cuda")
+    if not is_sm90a_supported(device):
+        pytest.skip("CP GDN prefill requires SM90")
+
+
 def _skip_if_not_sm100():
     """Skip test if not SM100 (Blackwell) with CUDA 13+."""
     device = torch.device("cuda")
@@ -72,6 +79,8 @@ def _test_prefill_kernel(
     seed: int | None = None,
 ):
     _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -272,6 +281,7 @@ def test_prefill_kernel_nonfull(
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(1, 1, 1), (16, 16, 64)],
@@ -282,9 +292,12 @@ def test_prefill_kernel_zero_length_sequence(
     num_q_heads: int,
     num_k_heads: int,
     num_v_heads: int,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
     random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -323,7 +336,7 @@ def test_prefill_kernel_zero_length_sequence(
         cu_seq_lens,
         True,
         output=ref_o,
-        use_cp=False,
+        use_cp=use_cp,
     )
     chunk_gated_delta_rule(
         q,
@@ -337,7 +350,7 @@ def test_prefill_kernel_zero_length_sequence(
         cu_seq_lens_with_empty,
         True,
         output=our_o,
-        use_cp=False,
+        use_cp=use_cp,
     )
     torch.cuda.synchronize()
 
