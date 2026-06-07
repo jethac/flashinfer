@@ -37,7 +37,11 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import generate_additional_params
+from .utils import (
+    generate_additional_params,
+    generate_sf_stride_setter_lines,
+    get_sf_stride_tensor_names,
+)
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -1858,6 +1862,9 @@ def gen_customize_batch_attention_module(
             )
         ]
         + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+        + generate_sf_stride_setter_lines(
+            get_sf_stride_tensor_names(additional_tensor_names), prefix="params[i]."
+        )
     )
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
