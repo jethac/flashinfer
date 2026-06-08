@@ -23,6 +23,7 @@ import torch
 from .. import env as jit_env
 from ..core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
@@ -1631,7 +1632,12 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return gen_jit_spec(uri, source_paths)
+        extra_cuda_cflags = (
+            common_nvcc_flags if kwargs["require_fp4_kv_cache"] else None
+        )
+        return gen_jit_spec(
+            uri, source_paths, extra_cuda_cflags=extra_cuda_cflags
+        )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (

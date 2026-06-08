@@ -25,6 +25,9 @@ using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
 {% if require_fp4_kv_cache %}
+#ifndef FLASHINFER_ENABLE_FP4_E2M1
+#error "NVFP4 KV paged prefill compiled without FLASHINFER_ENABLE_FP4_E2M1"
+#endif
 static_assert(std::is_same_v<DTypeKV, __nv_fp4x2_e2m1>,
               "NVFP4 KV paged prefill must build with the packed FP4 KV container type");
 {% endif %}
