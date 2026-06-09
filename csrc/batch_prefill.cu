@@ -17,6 +17,10 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
 
+#include <cstdlib>
+#include <cstdio>
+#include <type_traits>
+
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
 #include "tvm_ffi_utils.h"
@@ -43,6 +47,86 @@ using namespace flashinfer;
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+
+namespace {
+
+bool SparkPrefillDebugEnabled() {
+  const char* value = std::getenv("FLASHINFER_PREFILL_DEBUG_ONCE");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+void SparkPrintDType(const char* name, DLDataType dtype) {
+  std::fprintf(stderr, "%s_dtype={code=%u,bits=%u,lanes=%u} ", name, dtype.code, dtype.bits,
+               dtype.lanes);
+}
+
+void SparkPrintTensorView(const char* name, const TensorView& tensor) {
+  std::fprintf(stderr, "%s={ptr=%p,device=%d,ndim=%d,shape=[", name, tensor.data_ptr(),
+               tensor.device().device_id, tensor.ndim());
+  for (int i = 0; i < tensor.ndim(); ++i) {
+    std::fprintf(stderr, "%s%lld", i == 0 ? "" : ",",
+                 static_cast<long long>(tensor.size(i)));
+  }
+  std::fprintf(stderr, "],stride=[");
+  for (int i = 0; i < tensor.ndim(); ++i) {
+    std::fprintf(stderr, "%s%lld", i == 0 ? "" : ",",
+                 static_cast<long long>(tensor.stride(i)));
+  }
+  std::fprintf(stderr, "],");
+  SparkPrintDType("", tensor.dtype());
+  std::fprintf(stderr, "} ");
+}
+
+void SparkPrintOptionalTensorView(const char* name, const Optional<TensorView>& maybe_tensor) {
+  if (maybe_tensor.has_value()) {
+    SparkPrintTensorView(name, maybe_tensor.value());
+  } else {
+    std::fprintf(stderr, "%s=null ", name);
+  }
+}
+
+template <typename T>
+constexpr bool SparkIsFp4x2KvType() {
+#if defined(FLASHINFER_ENABLE_FP4_E2M1) && \
+    (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+  return std::is_same_v<T, __nv_fp4x2_e2m1>;
+#else
+  return false;
+#endif
+}
+
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+void SparkPrintPrefillJitIdentity(const char* path, const PrefillPlanInfo& plan_info,
+                                  int64_t layout, int64_t window_left, int64_t batch_size,
+                                  int64_t num_qo_heads, int64_t num_kv_heads,
+                                  int64_t page_size) {
+  std::fprintf(stderr,
+               "[flashinfer][prefill-debug] path=%s compiled={dtype_q=%s,dtype_kv=%s,"
+               "dtype_o=%s,idtype=%s,head_dim_qk=%d,head_dim_vo=%d,require_fp4_kv=%d,"
+               "use_swa=%d,use_logits_cap=%d,posenc=%d,use_fp16_qk_reduction=%d,"
+               "sizeof_q=%zu,sizeof_kv=%zu,sizeof_o=%zu,sizeof_id=%zu,"
+               "is_kv_fp4x2=%d,additional_tensors=%s,additional_tensor_dtypes=%s,"
+               "additional_scalars=%s,additional_scalar_dtypes=%s} "
+               "runtime={layout=%lld,window_left=%lld,batch_size=%lld,num_qo_heads=%lld,"
+               "num_kv_heads=%lld,page_size=%lld,split_kv=%d,cta_tile_q=%d,"
+               "enable_cuda_graph=%d,padded_batch_size=%u,total_num_rows=%u}\n",
+               path, JIT_DTYPE_Q_NAME, JIT_DTYPE_KV_NAME, JIT_DTYPE_O_NAME, JIT_IDTYPE_NAME,
+               HEAD_DIM_QK, HEAD_DIM_VO, static_cast<int>(REQUIRE_FP4_KV_CACHE),
+               static_cast<int>(USE_SLIDING_WINDOW), static_cast<int>(USE_LOGITS_SOFT_CAP),
+               static_cast<int>(POS_ENCODING_MODE), static_cast<int>(USE_FP16_QK_REDUCTION),
+               sizeof(DTypeQ_), sizeof(DTypeKV_), sizeof(DTypeO_), sizeof(IdType_),
+               static_cast<int>(SparkIsFp4x2KvType<DTypeKV_>()),
+               JIT_ADDITIONAL_TENSOR_NAMES, JIT_ADDITIONAL_TENSOR_DTYPES,
+               JIT_ADDITIONAL_SCALAR_NAMES, JIT_ADDITIONAL_SCALAR_DTYPES,
+               static_cast<long long>(layout), static_cast<long long>(window_left),
+               static_cast<long long>(batch_size), static_cast<long long>(num_qo_heads),
+               static_cast<long long>(num_kv_heads), static_cast<long long>(page_size),
+               static_cast<int>(plan_info.split_kv), plan_info.cta_tile_q,
+               static_cast<int>(plan_info.enable_cuda_graph), plan_info.padded_batch_size,
+               plan_info.total_num_rows);
+}
+
+}  // namespace
 
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
@@ -122,6 +206,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
       RaggedParams, PagedParams, [&] {
         RaggedParams params;
+        static bool debug_printed = false;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         params.k = static_cast<DTypeKV*>(k.data_ptr());
@@ -155,6 +240,24 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.partition_kv = false;
 
         ADDITIONAL_PARAMS_SETTER
+
+        if (SparkPrefillDebugEnabled() && !debug_printed) {
+          debug_printed = true;
+          SparkPrintPrefillJitIdentity<DTypeQ, DTypeKV, DTypeO, IdType>(
+              "ragged", plan_info, layout, window_left, /*batch_size=*/kv_indptr.size(0) - 1,
+              num_qo_heads, num_kv_heads, /*page_size=*/0);
+          std::fprintf(stderr, "[flashinfer][prefill-debug] tensors ");
+          SparkPrintTensorView("float_workspace", float_workspace_buffer);
+          SparkPrintTensorView("int_workspace", int_workspace_buffer);
+          SparkPrintTensorView("q", q);
+          SparkPrintTensorView("k", k);
+          SparkPrintTensorView("v", v);
+          SparkPrintTensorView("qo_indptr", qo_indptr);
+          SparkPrintTensorView("kv_indptr", kv_indptr);
+          SparkPrintTensorView("o", o);
+          SparkPrintOptionalTensorView("maybe_lse", maybe_lse);
+          std::fprintf(stderr, "\n");
+        }
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
@@ -252,6 +355,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
       RaggedParams, PagedParams, [&] {
         PagedParams params;
+        static bool debug_printed = false;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         paged_kv_t<DTypeKV, IdType> paged_kv(
@@ -286,6 +390,26 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.partition_kv = false;
 
         ADDITIONAL_PARAMS_SETTER
+
+        if (SparkPrefillDebugEnabled() && !debug_printed) {
+          debug_printed = true;
+          SparkPrintPrefillJitIdentity<DTypeQ, DTypeKV, DTypeO, IdType>(
+              "paged", plan_info, layout, window_left, batch_size, num_qo_heads, num_kv_heads,
+              page_size);
+          std::fprintf(stderr, "[flashinfer][prefill-debug] tensors ");
+          SparkPrintTensorView("float_workspace", float_workspace_buffer);
+          SparkPrintTensorView("int_workspace", int_workspace_buffer);
+          SparkPrintTensorView("q", q);
+          SparkPrintTensorView("paged_k_cache", paged_k_cache);
+          SparkPrintTensorView("paged_v_cache", paged_v_cache);
+          SparkPrintTensorView("qo_indptr", qo_indptr);
+          SparkPrintTensorView("paged_kv_indptr", paged_kv_indptr);
+          SparkPrintTensorView("paged_kv_indices", paged_kv_indices);
+          SparkPrintTensorView("paged_kv_last_page_len", paged_kv_last_page_len);
+          SparkPrintTensorView("o", o);
+          SparkPrintOptionalTensorView("maybe_lse", maybe_lse);
+          std::fprintf(stderr, "\n");
+        }
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
