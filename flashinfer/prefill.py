@@ -1661,9 +1661,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_additional_scalar_names = list(jit_args[9])
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_additional_scalar_names = []
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2504,21 +2506,46 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                run_args.extend(
-                    prepare_jit_additional_args(
-                        self._jit_additional_tensor_names,
-                        {
-                            "maybe_custom_mask": self._custom_mask_buf,
-                            "maybe_mask_indptr": self._mask_indptr_buf,
-                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                                q.shape[1], q.device
-                            ),
-                            "maybe_k_cache_sf": key_block_scales,
-                            "maybe_v_cache_sf": value_block_scales,
-                        },
-                        args,
-                    )
+                additional_args = prepare_jit_additional_args(
+                    self._jit_additional_tensor_names,
+                    {
+                        "maybe_custom_mask": self._custom_mask_buf,
+                        "maybe_mask_indptr": self._mask_indptr_buf,
+                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                            q.shape[1], q.device
+                        ),
+                        "maybe_prefix_len_ptr": self._prefix_len_ptr,
+                        "maybe_token_pos_in_items_ptr": self._token_pos_in_items_ptr,
+                        "maybe_max_item_len_ptr": self._max_item_len_ptr,
+                        "maybe_k_cache_sf": key_block_scales,
+                        "maybe_v_cache_sf": value_block_scales,
+                    },
+                    args,
                 )
+                expected_additional_arg_count = len(
+                    self._jit_additional_tensor_names
+                ) + len(self._jit_additional_scalar_names)
+                if len(additional_args) < expected_additional_arg_count:
+                    _, scale_q_scalar = _split_scale_param(q_scale)
+                    _, scale_k_scalar = _split_scale_param(k_scale)
+                    _, scale_v_scalar = _split_scale_param(v_scale)
+                    jit_scalar_values = {
+                        "logits_soft_cap": logits_soft_cap,
+                        "sm_scale": sm_scale,
+                        "rope_rcp_scale": 1.0 / rope_scale,
+                        "rope_rcp_theta": 1.0 / rope_theta,
+                        "scale_q_scalar": scale_q_scalar,
+                        "scale_k_scalar": scale_k_scalar,
+                        "scale_v_scalar": scale_v_scalar,
+                        "token_pos_in_items_len": self._token_pos_in_items_len,
+                    }
+                    scalar_start = max(
+                        0,
+                        len(additional_args) - len(self._jit_additional_tensor_names),
+                    )
+                    for name in self._jit_additional_scalar_names[scalar_start:]:
+                        additional_args.append(jit_scalar_values[name])
+                run_args.extend(additional_args)
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
