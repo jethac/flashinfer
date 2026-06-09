@@ -1545,6 +1545,20 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if require_fp4_kv_cache:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1552,7 +1566,7 @@ def gen_customize_batch_prefill_module(
         "dtype_kv": dtype_map_kv[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
-        "require_fp4_kv_cache": dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1",
+        "require_fp4_kv_cache": require_fp4_kv_cache,
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
