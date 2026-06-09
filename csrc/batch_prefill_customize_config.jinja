@@ -46,6 +46,18 @@ constexpr const char* JIT_ADDITIONAL_TENSOR_NAMES = "{{ additional_tensor_names 
 constexpr const char* JIT_ADDITIONAL_TENSOR_DTYPES = "{{ additional_tensor_dtypes | join(',') }}";
 constexpr const char* JIT_ADDITIONAL_SCALAR_NAMES = "{{ additional_scalar_names | join(',') }}";
 constexpr const char* JIT_ADDITIONAL_SCALAR_DTYPES = "{{ additional_scalar_dtypes | join(',') }}";
+constexpr const char* JIT_MODULE_URI = "{{ uri }}";
+constexpr const char* JIT_MODULE_BACKEND = "{{ backend }}";
+constexpr const char* JIT_MODULE_KEY =
+    "backend={{ backend }};uri={{ uri }};"
+    "dtype_q={{ dtype_q }};dtype_kv={{ dtype_kv }};dtype_o={{ dtype_o }};"
+    "idtype={{ idtype }};head_dim_qk={{ head_dim_qk }};head_dim_vo={{ head_dim_vo }};"
+    "posenc={{ pos_encoding_mode }};swa={{ use_sliding_window }};logits_cap={{ use_logits_soft_cap }};"
+    "fp16_qk={{ use_fp16_qk_reduction }};fp4_kv={{ '1' if require_fp4_kv_cache else '0' }};"
+    "additional_tensors={{ additional_tensor_names | join('|') }};"
+    "additional_tensor_dtypes={{ additional_tensor_dtypes | join('|') }};"
+    "additional_scalars={{ additional_scalar_names | join('|') }};"
+    "additional_scalar_dtypes={{ additional_scalar_dtypes | join('|') }}";
 
 
 struct RaggedParams {

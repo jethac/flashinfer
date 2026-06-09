@@ -19,6 +19,8 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
+#include <cstdint>
 #include <type_traits>
 
 #include "batch_prefill_config.inc"
@@ -53,6 +55,11 @@ namespace {
 bool SparkPrefillDebugEnabled() {
   const char* value = std::getenv("FLASHINFER_PREFILL_DEBUG_ONCE");
   return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+uint64_t SparkNextPrefillDebugCallId() {
+  static std::atomic<uint64_t> next_call_id{1};
+  return next_call_id.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SparkPrintDType(const char* name, DLDataType dtype) {
@@ -96,12 +103,14 @@ constexpr bool SparkIsFp4x2KvType() {
 }
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
-void SparkPrintPrefillJitIdentity(const char* path, const PrefillPlanInfo& plan_info,
+void SparkPrintPrefillJitIdentity(uint64_t debug_call_id, const char* path,
+                                  const PrefillPlanInfo& plan_info,
                                   int64_t layout, int64_t window_left, int64_t batch_size,
                                   int64_t num_qo_heads, int64_t num_kv_heads,
                                   int64_t page_size) {
   std::fprintf(stderr,
-               "[flashinfer][prefill-debug] path=%s compiled={dtype_q=%s,dtype_kv=%s,"
+               "[flashinfer][prefill-debug] call_id=%llu module_uri=%s module_key=%s path=%s "
+               "compiled={dtype_q=%s,dtype_kv=%s,"
                "dtype_o=%s,idtype=%s,head_dim_qk=%d,head_dim_vo=%d,require_fp4_kv=%d,"
                "use_swa=%d,use_logits_cap=%d,posenc=%d,use_fp16_qk_reduction=%d,"
                "sizeof_q=%zu,sizeof_kv=%zu,sizeof_o=%zu,sizeof_id=%zu,"
@@ -110,6 +119,7 @@ void SparkPrintPrefillJitIdentity(const char* path, const PrefillPlanInfo& plan_
                "runtime={layout=%lld,window_left=%lld,batch_size=%lld,num_qo_heads=%lld,"
                "num_kv_heads=%lld,page_size=%lld,split_kv=%d,cta_tile_q=%d,"
                "enable_cuda_graph=%d,padded_batch_size=%u,total_num_rows=%u}\n",
+               static_cast<unsigned long long>(debug_call_id), JIT_MODULE_URI, JIT_MODULE_KEY,
                path, JIT_DTYPE_Q_NAME, JIT_DTYPE_KV_NAME, JIT_DTYPE_O_NAME, JIT_IDTYPE_NAME,
                HEAD_DIM_QK, HEAD_DIM_VO, static_cast<int>(REQUIRE_FP4_KV_CACHE),
                static_cast<int>(USE_SLIDING_WINDOW), static_cast<int>(USE_LOGITS_SOFT_CAP),
@@ -243,10 +253,16 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
 
         if (SparkPrefillDebugEnabled() && !debug_printed) {
           debug_printed = true;
+          const uint64_t debug_call_id = SparkNextPrefillDebugCallId();
           SparkPrintPrefillJitIdentity<DTypeQ, DTypeKV, DTypeO, IdType>(
-              "ragged", plan_info, layout, window_left, /*batch_size=*/kv_indptr.size(0) - 1,
-              num_qo_heads, num_kv_heads, /*page_size=*/0);
-          std::fprintf(stderr, "[flashinfer][prefill-debug] tensors ");
+              debug_call_id, "ragged", plan_info, layout, window_left,
+              /*batch_size=*/kv_indptr.size(0) - 1, num_qo_heads, num_kv_heads,
+              /*page_size=*/0);
+          std::fprintf(stderr,
+                       "[flashinfer][prefill-debug] tensors call_id=%llu module_uri=%s "
+                       "module_key=%s path=ragged ",
+                       static_cast<unsigned long long>(debug_call_id), JIT_MODULE_URI,
+                       JIT_MODULE_KEY);
           SparkPrintTensorView("float_workspace", float_workspace_buffer);
           SparkPrintTensorView("int_workspace", int_workspace_buffer);
           SparkPrintTensorView("q", q);
@@ -393,10 +409,15 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         if (SparkPrefillDebugEnabled() && !debug_printed) {
           debug_printed = true;
+          const uint64_t debug_call_id = SparkNextPrefillDebugCallId();
           SparkPrintPrefillJitIdentity<DTypeQ, DTypeKV, DTypeO, IdType>(
-              "paged", plan_info, layout, window_left, batch_size, num_qo_heads, num_kv_heads,
-              page_size);
-          std::fprintf(stderr, "[flashinfer][prefill-debug] tensors ");
+              debug_call_id, "paged", plan_info, layout, window_left, batch_size, num_qo_heads,
+              num_kv_heads, page_size);
+          std::fprintf(stderr,
+                       "[flashinfer][prefill-debug] tensors call_id=%llu module_uri=%s "
+                       "module_key=%s path=paged ",
+                       static_cast<unsigned long long>(debug_call_id), JIT_MODULE_URI,
+                       JIT_MODULE_KEY);
           SparkPrintTensorView("float_workspace", float_workspace_buffer);
           SparkPrintTensorView("int_workspace", int_workspace_buffer);
           SparkPrintTensorView("q", q);
