@@ -1299,6 +1299,8 @@ def gen_customize_single_prefill_module(
     fp8_enabled: bool = False,
 ) -> JitSpec:
     kwargs = {
+        "backend": backend,
+        "uri": uri,
         "variant_decl": variant_decl,
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
