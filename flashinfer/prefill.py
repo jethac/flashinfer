@@ -2513,6 +2513,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_k_cache_sf": key_block_scales,
+                            "maybe_v_cache_sf": value_block_scales,
                         },
                         args,
                     )
