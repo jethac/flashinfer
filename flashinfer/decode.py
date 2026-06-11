@@ -912,6 +912,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
@@ -1057,6 +1059,29 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if kv_data_type is None:
                 kv_data_type = data_type
 
+        if k_data_type is not None or v_data_type is not None:
+            # Split K/V dtype kwargs (SGLang-era API drift): equal dtypes
+            # collapse to kv_data_type; unequal needs dtype_k/dtype_v module
+            # keying, which this branch does not wire yet - fail loudly
+            # instead of TypeError-ing at the call site.
+            _kd = (
+                canonicalize_torch_dtype(k_data_type)
+                if k_data_type is not None
+                else None
+            )
+            _vd = (
+                canonicalize_torch_dtype(v_data_type)
+                if v_data_type is not None
+                else None
+            )
+            if _kd is not None and _vd is not None and _kd != _vd:
+                raise NotImplementedError(
+                    "k_data_type != v_data_type requires split-dtype module "
+                    "keying (not wired on this branch); pass equal dtypes "
+                    "or kv_data_type"
+                )
+            if kv_data_type is None:
+                kv_data_type = _kd if _kd is not None else _vd
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
