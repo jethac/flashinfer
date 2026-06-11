@@ -1075,11 +1075,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 else None
             )
             if _kd is not None and _vd is not None and _kd != _vd:
-                raise NotImplementedError(
-                    "k_data_type != v_data_type requires split-dtype module "
-                    "keying (not wired on this branch); pass equal dtypes "
-                    "or kv_data_type"
-                )
+                if _kd == torch.float8_e4m3fn and _vd == torch.uint8:
+                    # SGLang mixed-KV convention (K stored fp8_e4m3, V packed
+                    # NVFP4): served by the FP4-capable paged module, whose
+                    # mixed read of fp8-K alongside packed-fp4-V is the
+                    # convention-bridge-validated path. Select that module.
+                    kv_data_type = torch.uint8
+                else:
+                    raise NotImplementedError(
+                        "k_data_type != v_data_type requires split-dtype "
+                        "module keying (not wired on this branch) except "
+                        "for the validated (float8_e4m3fn, uint8) mixed-KV "
+                        "pair; pass equal dtypes or kv_data_type"
+                    )
             if kv_data_type is None:
                 kv_data_type = _kd if _kd is not None else _vd
         q_data_type = canonicalize_torch_dtype(q_data_type)
