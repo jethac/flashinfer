@@ -1789,8 +1789,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        k_data_type: Optional[Union[str, torch.dtype]] = None,
-        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -1926,37 +1924,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        if k_data_type is not None or v_data_type is not None:
-            # Split K/V dtype kwargs (SGLang-era API drift): equal dtypes
-            # collapse to kv_data_type; unequal needs dtype_k/dtype_v module
-            # keying, which this branch does not wire yet - fail loudly
-            # instead of TypeError-ing at the call site.
-            _kd = (
-                canonicalize_torch_dtype(k_data_type)
-                if k_data_type is not None
-                else None
-            )
-            _vd = (
-                canonicalize_torch_dtype(v_data_type)
-                if v_data_type is not None
-                else None
-            )
-            if _kd is not None and _vd is not None and _kd != _vd:
-                if _kd == torch.float8_e4m3fn and _vd == torch.uint8:
-                    # SGLang mixed-KV convention (K stored fp8_e4m3, V packed
-                    # NVFP4): served by the FP4-capable paged module, whose
-                    # mixed read of fp8-K alongside packed-fp4-V is the
-                    # convention-bridge-validated path. Select that module.
-                    kv_data_type = torch.uint8
-                else:
-                    raise NotImplementedError(
-                        "k_data_type != v_data_type requires split-dtype "
-                        "module keying (not wired on this branch) except "
-                        "for the validated (float8_e4m3fn, uint8) mixed-KV "
-                        "pair; pass equal dtypes or kv_data_type"
-                    )
-            if kv_data_type is None:
-                kv_data_type = _kd if _kd is not None else _vd
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -2964,8 +2931,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        k_data_type: Optional[Union[str, torch.dtype]] = None,
-        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -3099,37 +3064,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        if k_data_type is not None or v_data_type is not None:
-            # Split K/V dtype kwargs (SGLang-era API drift): equal dtypes
-            # collapse to kv_data_type; unequal needs dtype_k/dtype_v module
-            # keying, which this branch does not wire yet - fail loudly
-            # instead of TypeError-ing at the call site.
-            _kd = (
-                canonicalize_torch_dtype(k_data_type)
-                if k_data_type is not None
-                else None
-            )
-            _vd = (
-                canonicalize_torch_dtype(v_data_type)
-                if v_data_type is not None
-                else None
-            )
-            if _kd is not None and _vd is not None and _kd != _vd:
-                if _kd == torch.float8_e4m3fn and _vd == torch.uint8:
-                    # SGLang mixed-KV convention (K stored fp8_e4m3, V packed
-                    # NVFP4): served by the FP4-capable paged module, whose
-                    # mixed read of fp8-K alongside packed-fp4-V is the
-                    # convention-bridge-validated path. Select that module.
-                    kv_data_type = torch.uint8
-                else:
-                    raise NotImplementedError(
-                        "k_data_type != v_data_type requires split-dtype "
-                        "module keying (not wired on this branch) except "
-                        "for the validated (float8_e4m3fn, uint8) mixed-KV "
-                        "pair; pass equal dtypes or kv_data_type"
-                    )
-            if kv_data_type is None:
-                kv_data_type = _kd if _kd is not None else _vd
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
