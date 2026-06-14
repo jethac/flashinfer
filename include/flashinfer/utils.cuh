@@ -110,6 +110,30 @@
     FLASHINFER_ERROR(err_msg.str());                     \
   }
 
+// Clean, real-shared-memory rejection. If even the minimum *valid* KV tile won't fit this GPU's
+// shared memory, abort with an actionable message (real byte counts + cause) instead of the cryptic
+// "Unsupported max_mma_kv: 0" / "Invalid configuration NUM_MMA_KV=1 ...". Fires e.g. for fp8 KV at
+// head_dim_qk=512 on CC 12.x, where the bf16 repack staging buffer (which nvfp4 avoids via in-loop
+// dequant) blows the ~100 KB/SM budget. Self-clearing: allows the config on any GPU/dtype where it
+// genuinely fits, so this is a correctness guard, not a hardcoded "unsupported". Expanded where the
+// loop-local names below are in scope (the three FA2 prefill dispatch sites).
+#define FA2_REJECT_IF_KV_SMEM_INSUFFICIENT()                                                     \
+  if (min(max_num_mma_kv_smem, max_num_mma_kv_reg) < kMinValidMmaKV) {                           \
+    std::ostringstream _fi_kv_e;                                                                 \
+    _fi_kv_e << "FlashInfer: KV tile (head_dim_qk=" << HEAD_DIM_QK                               \
+             << " head_dim_vo=" << HEAD_DIM_VO << " cta_tile_q=" << CTA_TILE_Q << ", "           \
+             << (sizeof(DTypeKV) == 1 ? "1-byte" : "2-byte")                                     \
+             << " KV) does not fit shared memory on this GPU: the minimum valid tile needs "     \
+             << (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kMinValidMmaKV * kKVSmemPerMmaKV)   \
+             << " B but only " << max_smem_per_threadblock << " B/threadblock is available ("    \
+             << max_smem_per_sm << " B/SM). "                                                    \
+             << (kUseRepack ? "fp8 KV needs a bf16 repack staging buffer in shared memory that " \
+                              "nvfp4 avoids (in-loop dequant) -- use an nvfp4 KV cache, "         \
+                            : "Use ")                                                            \
+             << "a smaller head_dim, or a GPU with more shared memory per SM.";                  \
+    FLASHINFER_ERROR(_fi_kv_e.str());                                                            \
+  }
+
 #define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
   switch (cta_tile_q) {                                    \
     case 128: {                                            \
