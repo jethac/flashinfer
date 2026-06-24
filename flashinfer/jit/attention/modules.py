@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -388,10 +388,23 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
+    if dtype_k is None:
+        dtype_k = dtype_kv
+    if dtype_v is None:
+        dtype_v = dtype_kv
+    split_kv_suffix = ""
+    if dtype_k != dtype_kv or dtype_v != dtype_kv:
+        split_kv_suffix = (
+            f"dtype_k_{filename_safe_dtype_map_kv(dtype_k)}_"
+            f"dtype_v_{filename_safe_dtype_map_kv(dtype_v)}_"
+        )
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"{split_kv_suffix}"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -977,7 +990,13 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
+    if dtype_k is None:
+        dtype_k = dtype_kv
+    if dtype_v is None:
+        dtype_v = dtype_kv
     uri = get_batch_prefill_uri(
         backend,
         dtype_q,
@@ -990,6 +1009,8 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        dtype_k,
+        dtype_v,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1091,6 +1112,8 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1544,8 +1567,17 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
-    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if dtype_k is None:
+        dtype_k = dtype_kv
+    if dtype_v is None:
+        dtype_v = dtype_kv
+    require_fp4_kv_cache = (
+        dtype_map_kv[dtype_k] == "__nv_fp4x2_e2m1"
+        or dtype_map_kv[dtype_v] == "__nv_fp4x2_e2m1"
+    )
     if require_fp4_kv_cache:
         missing_sf_tensors = [
             name
@@ -1564,6 +1596,8 @@ def gen_customize_batch_prefill_module(
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_k": dtype_map_kv[dtype_k],
+        "dtype_v": dtype_map_kv[dtype_v],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
         "require_fp4_kv_cache": require_fp4_kv_cache,

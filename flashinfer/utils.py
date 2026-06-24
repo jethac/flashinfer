@@ -173,8 +173,12 @@ def _unpack_paged_kv_cache(
     if isinstance(paged_kv_cache, tuple):
         paged_k_cache, paged_v_cache = paged_kv_cache
         return (
-            _expand_4d(paged_k_cache, kv_layout),
-            _expand_4d(paged_v_cache, kv_layout),
+            _expand_4d(paged_k_cache, kv_layout)
+            if paged_k_cache is not None
+            else None,
+            _expand_4d(paged_v_cache, kv_layout)
+            if paged_v_cache is not None
+            else None,
         )
     elif torch.is_tensor(paged_kv_cache):
         # NOTE(Zihao): split on the second dimension

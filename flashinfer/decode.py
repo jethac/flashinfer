@@ -912,6 +912,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
@@ -1061,6 +1063,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        v_data_type = canonicalize_torch_dtype(v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -1074,6 +1082,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -1187,14 +1197,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     if {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
+                    } & {q_data_type, k_data_type, v_data_type}:
                         self._backend = determine_attention_backend(
                             self.device,
                             PosEncodingMode[pos_encoding_mode].value,
                             False,  # use_fp16_qk_reductions
                             False,  # use_custom_mask
                             q_data_type,
-                            kv_data_type,
+                            k_data_type,
                         )
                     else:
                         self._backend = "fa2"
@@ -1210,6 +1220,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    k_data_type,
+                    v_data_type,
                 )
 
             args = [
@@ -1238,6 +1250,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 *args,
             )
         else:
+            if k_data_type != kv_data_type or v_data_type != kv_data_type:
+                raise NotImplementedError(
+                    "Mixed K/V dtypes require tensor-core batch decode; "
+                    "set use_tensor_cores=True."
+                )
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
@@ -1472,8 +1489,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
         _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            q, k_cache, self._cached_q_data_type, self._cached_k_data_type
         )
+        if v_cache.dtype != self._cached_v_data_type:
+            raise ValueError(
+                f"The dtype of v {v_cache.dtype} does not match the v_data_type {self._cached_v_data_type} specified in plan function."
+            )
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
         # Soft-deprecation: q_len_per_req moved to plan(). Accept it at run()
         # with a warning and use to validate q.size(0)
@@ -3111,6 +3132,8 @@ def fast_decode_plan(
     logits_soft_cap: Optional[float] = None,
     q_data_type: Optional[Union[str, torch.dtype]] = None,
     kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    k_data_type: Optional[Union[str, torch.dtype]] = None,
+    v_data_type: Optional[Union[str, torch.dtype]] = None,
     data_type: Optional[Union[str, torch.dtype]] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -3141,6 +3164,10 @@ def fast_decode_plan(
 
     if kv_data_type is None:
         kv_data_type = q_data_type
+    if k_data_type is None:
+        k_data_type = kv_data_type
+    if v_data_type is None:
+        v_data_type = kv_data_type
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
@@ -3266,3 +3293,15 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+    self._cached_q_data_type = (
+        getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+    )
+    self._cached_kv_data_type = (
+        getattr(torch, kv_data_type) if isinstance(kv_data_type, str) else kv_data_type
+    )
+    self._cached_k_data_type = (
+        getattr(torch, k_data_type) if isinstance(k_data_type, str) else k_data_type
+    )
+    self._cached_v_data_type = (
+        getattr(torch, v_data_type) if isinstance(v_data_type, str) else v_data_type
+    )

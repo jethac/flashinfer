@@ -188,6 +188,8 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -209,6 +211,8 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     ).build_and_load()
 
 
@@ -1787,6 +1791,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -1926,6 +1932,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        v_data_type = canonicalize_torch_dtype(v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -2065,6 +2077,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
@@ -2077,7 +2091,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
-                    kv_data_type,
+                    k_data_type,
                 )
             if self._backend != "cudnn":
                 get_module_args = (
@@ -2091,6 +2105,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    k_data_type,
+                    v_data_type,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -2344,8 +2360,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            q, k_cache, self._cached_q_data_type, self._cached_k_data_type
         )
+        if v_cache.dtype != self._cached_v_data_type:
+            raise ValueError(
+                f"The dtype of v {v_cache.dtype} does not match the v_data_type {self._cached_v_data_type} specified in plan function."
+            )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:

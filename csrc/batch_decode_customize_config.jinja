@@ -17,6 +17,8 @@ using namespace flashinfer;
 
 using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
+using DTypeK = DTypeKV;
+using DTypeV = DTypeKV;
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
 constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
@@ -28,11 +30,13 @@ constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 struct Params {
   using DTypeQ = DTypeQ;
   using DTypeKV = DTypeKV;
+  using DTypeK = DTypeK;
+  using DTypeV = DTypeV;
   using DTypeO = DTypeO;
   using IdType = IdType;
 
   DTypeQ* q;
-  paged_kv_t<DTypeKV, IdType> paged_kv;
+  paged_kv_t<DTypeK, IdType, DTypeV> paged_kv;
   DTypeO* o;
   float* lse;
 
