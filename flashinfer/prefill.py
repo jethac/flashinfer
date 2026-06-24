@@ -1369,7 +1369,7 @@ def single_prefill_with_kv_cache(
     if o_dtype is None:
         o_dtype = q.dtype
     # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    out_head_dim = v.shape[-1] * 2 if kv_cache_sf is not None else v.shape[-1]
     out = torch.empty(q.shape[:-1] + (out_head_dim,), dtype=o_dtype, device=q.device)
 
     module = get_single_prefill_module(
@@ -2416,7 +2416,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
+        out_head_dim = v_cache.shape[-1] * 2 if kv_cache_sf is not None else v_cache.shape[-1]
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -3463,7 +3463,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
 
         # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
-        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+        out_head_dim = v.shape[-1] * 2 if kv_cache_sf is not None else v.shape[-1]
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
