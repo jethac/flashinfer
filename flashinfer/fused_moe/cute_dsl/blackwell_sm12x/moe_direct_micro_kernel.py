@@ -379,12 +379,12 @@ class MoEDirectMicroKernel:
         dynamic_down_scale: bool = False,
         w4a16_mode: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = activation in ("silu", "gelu_tanh")
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token
@@ -2145,10 +2145,20 @@ class MoEDirectMicroKernel:
                     up_red = cute.arch.warp_reduction_sum(partial_up) * alpha_fc1
                 if lane == Int32(0):
                     if cutlass.const_expr(self.is_gated):
-                        sigmoid = Float32(1.0) / (
-                            Float32(1.0) + cute.math.exp(-gate_red, fastmath=False)
-                        )
-                        activated = sigmoid * gate_red * up_red
+                        if cutlass.const_expr(self.activation == "gelu_tanh"):
+                            x = gate_red
+                            inner = Float32(0.7978845608028654) * (
+                                x + Float32(0.044715) * x * x * x
+                            )
+                            gelu = Float32(0.5) * x * (
+                                Float32(1.0) + cute.math.tanh(inner, fastmath=False)
+                            )
+                            activated = gelu * up_red
+                        else:
+                            sigmoid = Float32(1.0) / (
+                                Float32(1.0) + cute.math.exp(-gate_red, fastmath=False)
+                            )
+                            activated = sigmoid * gate_red * up_red
                     else:
                         relu_val = fmax_f32(gate_red, Float32(0.0))
                         activated = relu_val * relu_val

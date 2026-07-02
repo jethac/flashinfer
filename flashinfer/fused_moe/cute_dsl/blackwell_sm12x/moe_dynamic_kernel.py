@@ -278,7 +278,7 @@ class MoEDynamicKernel:
         activation: str = "silu",
         share_input_across_experts: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
@@ -286,7 +286,7 @@ class MoEDynamicKernel:
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = activation in ("silu", "gelu_tanh")
         self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
@@ -2189,13 +2189,15 @@ class MoEDynamicKernel:
                                         ):
                                             g = alpha_value * gate_slice[elem_idx]
                                             u = alpha_value * up_slice[elem_idx]
-                                            sigmoid_g = cute.arch.rcp_approx(
-                                                cutlass.Float32(1.0)
-                                                + cute.math.exp(
-                                                    -g, fastmath=self.fast_math
-                                                ),
-                                            )
-                                            tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                            if cutlass.const_expr(self.activation == "gelu_tanh"):
+                                                _inner = cutlass.Float32(0.7978845608028654) * (g + cutlass.Float32(0.044715) * g * g * g)
+                                                _act = cutlass.Float32(0.5) * g * (cutlass.Float32(1.0) + cute.math.tanh(_inner, fastmath=self.fast_math))
+                                                tRS_rD_slice[elem_idx] = _act * u
+                                            else:
+                                                sigmoid_g = cute.arch.rcp_approx(
+                                                    cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=self.fast_math)
+                                                )
+                                                tRS_rD_slice[elem_idx] = g * sigmoid_g * u
                                     else:
                                         for elem_idx in cutlass.range_constexpr(
                                             cute.size(tRS_rD_slice)
