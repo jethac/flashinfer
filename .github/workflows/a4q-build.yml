@@ -83,7 +83,9 @@ jobs:
           # MUST come AFTER the torch install: the cpu index carries an old
           # setuptools (70.2.0) and pip downgrades it (red run 28608075126).
           pip install -U "setuptools>=77" packaging wheel ninja
-          pip show setuptools | head -2
+          # NOTE: no `pip show | head` here - head under pipefail SIGPIPEs
+          # pip (exit 120, red run 28608693997).
+          python -c "import setuptools; print('setuptools', setuptools.__version__)"
           pip install --no-build-isolation -e . -v
           python -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
 
