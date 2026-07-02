@@ -219,12 +219,12 @@ struct KernelTraits {
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) ||
             // A4Q v2 scope: nvf4 QK MMA requires fp4 KV, head_dim_qk in {128,256,512}
             // (2/4/8 k64 blocks), head_dim_vo in {128,256} (PV cap; 512-QK pairs with
-            // the VO-split 512/256 dispatch), fp32 QK accum, no positional encoding,
-            // and an even NUM_MMA_KV (MMAs are issued in n32 pairs).
+            // the VO-split 512/256 dispatch), fp32 QK accum, no positional encoding.
+            // MMAs are issued in n32 pairs with an n16 tail for odd NUM_MMA_KV.
             (USE_NVF4_QK &&
              (!is_fp4_type_v<DTypeKV_> ||
               !(HEAD_DIM_QK == 128 || HEAD_DIM_QK == 256 || HEAD_DIM_QK == 512) ||
-              !(HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256) || NUM_MMA_KV % 2 != 0 ||
+              !(HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256) ||
               POS_ENCODING_MODE != PosEncodingMode::kNone ||
               !std::is_same_v<DTypeQKAccum_, float>)));
   }
@@ -1164,7 +1164,6 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
   static_assert(is_fp4_type_v<typename KTraits::DTypeKV>, "nvf4 QK requires fp4 KV");
   static_assert(HEAD_DIM_QK == 128 || HEAD_DIM_QK == 256 || HEAD_DIM_QK == 512,
                 "A4Q supports head_dim_qk in {128, 256, 512} (2/4/8 k64 blocks)");
-  static_assert(NUM_MMA_KV % 2 == 0, "nvf4 QK issues MMAs in n32 (2 x n16) pairs");
   static_assert(KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B,
                 "fp4 KV at head_dim >= 128 uses the k128B swizzle");
   const uint8_t* q_sf_smem = q_smem_bytes + KTraits::CTA_TILE_Q * ROW_BYTES_Q;
@@ -1237,6 +1236,42 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
                              sfb);
         mma_nvf4_m16n8k64<3>(&s_frag[mma_q][2 * p + 1][4], a_frag[mma_q], b[6], b[7], sfa[mma_q],
                              sfb);
+      }
+    }
+
+    // ---- odd-NUM_MMA_KV tail: one n16 fragment via sub-MMAs 0/1 only.
+    // Needed for smem-tight geometries (e.g. fp4 512/256, where one KV step is
+    // ~50KB and the dispatcher lands on NUM_MMA_KV=1). The SFB register fetch
+    // spreads rows across lanes ((lane%4)*8 + lane/4); lanes with (lane%4)>=2
+    // hold rows 16..31 past the n16 tile, but those lanes only feed the
+    // SKIPPED sub-MMAs 2/3 (tidB selects the lane quartet), so their values
+    // are dead. The reads themselves stay inside SharedStorage (k_sf_smem
+    // overruns into v_sf_smem, worst case a few hundred bytes).
+    if constexpr (NUM_MMA_KV % 2 == 1) {
+      const uint32_t p = NUM_MMA_KV / 2;
+      const uint32_t slot_lo = kb * 4 + (tr >> 1);
+      const uint32_t byte_in_slot = (tr & 1) * 4;
+      uint32_t b[4];
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const uint32_t row = warp_kv_row_base + p * 32 + tq + 8 * j;
+        const uint32_t off_lo =
+            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
+                row, slot_lo);
+        const uint32_t off_hi =
+            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
+                row, slot_lo + 2);
+        b[2 * j] =
+            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_lo * 16 + byte_in_slot);
+        b[2 * j + 1] =
+            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_hi * 16 + byte_in_slot);
+      }
+      const uint32_t sfb =
+          *reinterpret_cast<const uint32_t*>(k_sf_smem + (p * 32 + bn) * SF_COLS + kb * 4);
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+        mma_nvf4_m16n8k64<0>(&s_frag[mma_q][2 * p][0], a_frag[mma_q], b[0], b[1], sfa[mma_q], sfb);
+        mma_nvf4_m16n8k64<1>(&s_frag[mma_q][2 * p][4], a_frag[mma_q], b[2], b[3], sfa[mma_q], sfb);
       }
     }
   }
