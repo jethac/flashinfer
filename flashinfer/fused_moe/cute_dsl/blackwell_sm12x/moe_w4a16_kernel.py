@@ -2935,11 +2935,22 @@ class W4A16FusedMoeKernel:
                 up = fc1_bf16_flat[base + Int32(self.intermediate_size) + col].to(
                     cutlass.Float32
                 )
-                silu = gate / (
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
-                )
+                if cutlass.const_expr(self.activation == "gelu_tanh"):
+                    # tanh-approx GELU: 0.5*g*(1 + tanh(sqrt(2/pi)*(g + 0.044715*g^3)))
+                    # constants match the NVFP4 b12x kernels / upstream #3744;
+                    # fastmath=False mirrors the silu exp() discipline on this path.
+                    inner = cutlass.Float32(0.7978845608028654) * (
+                        gate + cutlass.Float32(0.044715) * gate * gate * gate
+                    )
+                    act = cutlass.Float32(0.5) * gate * (
+                        cutlass.Float32(1.0) + cute.math.tanh(inner, fastmath=False)
+                    )
+                else:
+                    act = gate / (
+                        cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
+                    )
                 activated_bf16_flat[idx] = self._cast_elem(
-                    self._cast_elem(silu) * self._cast_elem(up)
+                    self._cast_elem(act) * self._cast_elem(up)
                 )
             else:
                 x = fc1_bf16_flat[idx].to(cutlass.Float32)
@@ -3009,11 +3020,22 @@ class W4A16ActivationKernel:
                 up = fc1_flat[base + Int32(self.intermediate_size) + col].to(
                     cutlass.Float32
                 )
-                silu = gate / (
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
-                )
+                if cutlass.const_expr(self.activation == "gelu_tanh"):
+                    # tanh-approx GELU: 0.5*g*(1 + tanh(sqrt(2/pi)*(g + 0.044715*g^3)))
+                    # constants match the NVFP4 b12x kernels / upstream #3744;
+                    # fastmath=False mirrors the silu exp() discipline on this path.
+                    inner = cutlass.Float32(0.7978845608028654) * (
+                        gate + cutlass.Float32(0.044715) * gate * gate * gate
+                    )
+                    act = cutlass.Float32(0.5) * gate * (
+                        cutlass.Float32(1.0) + cute.math.tanh(inner, fastmath=False)
+                    )
+                else:
+                    act = gate / (
+                        cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False)
+                    )
                 activated_flat[idx] = self._cast_elem(
-                    self._cast_elem(silu) * self._cast_elem(up)
+                    self._cast_elem(act) * self._cast_elem(up)
                 )
             else:
                 x = fc1_flat[idx].to(cutlass.Float32)
