@@ -1,0 +1,163 @@
+# J-8 (nemotron-nvfp4kv campaign): CI build for the A4Q prototype branch.
+#
+# KEY ECONOMICS: nvcc cross-compilation needs NO GPU. This workflow proves, on
+# every push to a4q-prototype, that the A4Q nvf4 block-scaled QK MMA kernels
+# (use_nvf4_qk fa2 prefill modules + the nvfp4 Q/KV-quantize CUDA op) still
+# compile for sm_120a — and, informationally, for the sm_120f family target
+# (J-6) — without renting a GPU box.
+#
+# Runner note (J-8 probe, 2026-07-03): this account has NO premium runner
+# labels (ubuntu-latest-16-cores / -8-cores queue forever) and the old
+# ubicloud static runner is gone. Standard hosted runners are 4 vCPU / 15 GiB
+# RAM / ~110 GB free disk, for both x86_64 and arm64. MAX_JOBS is tuned to
+# that shape.
+#
+# Toolchain follows the campaign known-good path: CUDA 13.0 via the NVIDIA
+# apt repo (the pip "nvcc" cu13 wheel is ptxas-only - dead end). torch is the
+# CPU wheel: it is only imported for codegen/dtype plumbing; the compiled
+# modules link against TVM-FFI, not torch.
+
+name: a4q-build
+
+on:
+  push:
+    branches:
+      - a4q-prototype
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a4q-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUDA_HOME: /usr/local/cuda-13.0
+
+jobs:
+  # Compile the A4Q JIT modules (the actual K-3/K-5 kernels) per arch.
+  a4q-jit-compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: "12.0a" # A4Q v1 target (5090 / RTX PRO 6000, CC 12.0)
+            required: true
+          - arch: "12.0f" # J-6 family target - informational until J-6 lands
+            required: false
+    # continue-on-error keeps the 12.0f leg from failing the run while J-6
+    # (family-specific guards) is still queued; its result is still visible.
+    continue-on-error: ${{ !matrix.required }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout (with cutlass/spdlog submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA 13.0 toolkit (NVIDIA apt repo - campaign known-good path)
+        run: |
+          set -euxo pipefail
+          source /etc/os-release
+          UBREPO="ubuntu$(echo "${VERSION_ID}" | tr -d .)"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${UBREPO}/x86_64/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y cuda-toolkit-13-0
+          ${CUDA_HOME}/bin/nvcc --version
+
+      - name: Install torch (CPU) + flashinfer editable
+        run: |
+          set -euxo pipefail
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-build-isolation -e . -v
+          python -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
+
+      - name: Compile A4Q modules (no GPU - nvcc cross-compile via FLASHINFER_CUDA_ARCH_LIST)
+        env:
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch }}
+          FLASHINFER_WORKSPACE_BASE: ${{ github.workspace }}/fi-workspace
+          MAX_JOBS: "4"
+          FLASHINFER_NVCC_THREADS: "1"
+        run: |
+          set -euxo pipefail
+          export PATH="${CUDA_HOME}/bin:${PATH}"
+          python - <<'EOF'
+          import torch
+          from flashinfer.jit import gen_fp4_kv_quantization_module
+          from flashinfer.jit.attention.modules import (
+              gen_batch_prefill_module,
+              gen_single_prefill_module,
+          )
+          from flashinfer.jit.core import build_jit_specs
+
+          # The A4Q module shapes exactly as the runtime requests them
+          # (prefill.py: q packed-e2m1 viewed as bf16, kv packed uint8,
+          # head_dim 128, pos_encoding NONE):
+          specs = [
+              # A4Q nvf4-QK single prefill (a4q_test_single path)
+              gen_single_prefill_module(
+                  "fa2", torch.bfloat16, torch.uint8, torch.bfloat16,
+                  128, 128, 0, False, False, False, True),
+              # A4Q nvf4-QK batch/paged prefill (vLLM A4Q-WIRE path)
+              gen_batch_prefill_module(
+                  "fa2", torch.bfloat16, torch.uint8, torch.bfloat16,
+                  torch.int32, 128, 128, 0, False, False, False, True),
+              # Current (non-a4q) fp4-KV prefill - regression signal for the
+              # shared prefill.cuh changes
+              gen_batch_prefill_module(
+                  "fa2", torch.bfloat16, torch.uint8, torch.bfloat16,
+                  torch.int32, 128, 128, 0, False, False, False, False),
+              # K-5 CUDA Q/KV-quantize op (nvfp4_quantize_q_cuda)
+              gen_fp4_kv_quantization_module(),
+          ]
+          build_jit_specs(specs, verbose=True, skip_prebuilt=False)
+          print("A4Q_COMPILE PASS:", len(specs), "modules")
+          EOF
+          find fi-workspace -name "*.so" -exec ls -la {} \;
+
+      - name: Upload compiled modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: a4q-jit-modules-${{ matrix.arch }}
+          path: fi-workspace/.cache/flashinfer/**/*.so
+          retention-days: 30
+
+  # flashinfer-python wheel (JIT-source wheel; no CUDA compile - fast) so the
+  # branch has an installable artifact to pair with the vLLM a4q wheels.
+  python-wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with submodules - packaged as data dirs)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build flashinfer-python wheel
+        run: |
+          set -euxo pipefail
+          pip install build
+          python -m build --wheel --outdir dist .
+          ls -la dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-python-wheel
+          path: dist/*.whl
+          retention-days: 30
