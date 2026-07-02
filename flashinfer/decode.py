@@ -1011,6 +1011,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
 
+        if use_nvf4_qk and not self.use_tensor_cores:
+            # A4Q decode rides the tensor-core (batch-prefill-module) route only.
+            raise ValueError(
+                "use_nvf4_qk requires use_tensor_cores=True (fa2 tensor-core decode)"
+            )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
