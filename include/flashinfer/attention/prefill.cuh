@@ -217,11 +217,15 @@ struct KernelTraits {
              256) ||
             (sizeof(DTypeKV) == 1 && NUM_MMA_KV * 2 % NUM_WARPS_Q != 0) ||
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) ||
-            // A4Q v1 scope: nvf4 QK MMA requires fp4 KV, head_dim 128, fp32 QK accum,
-            // no positional encoding, and an even NUM_MMA_KV (MMAs are issued in n32 pairs).
+            // A4Q v2 scope: nvf4 QK MMA requires fp4 KV, head_dim_qk in {128,256,512}
+            // (2/4/8 k64 blocks), head_dim_vo in {128,256} (PV cap; 512-QK pairs with
+            // the VO-split 512/256 dispatch), fp32 QK accum, no positional encoding,
+            // and an even NUM_MMA_KV (MMAs are issued in n32 pairs).
             (USE_NVF4_QK &&
-             (!is_fp4_type_v<DTypeKV_> || HEAD_DIM_QK != 128 || HEAD_DIM_VO != 128 ||
-              NUM_MMA_KV % 2 != 0 || POS_ENCODING_MODE != PosEncodingMode::kNone ||
+             (!is_fp4_type_v<DTypeKV_> ||
+              !(HEAD_DIM_QK == 128 || HEAD_DIM_QK == 256 || HEAD_DIM_QK == 512) ||
+              !(HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256) || NUM_MMA_KV % 2 != 0 ||
+              POS_ENCODING_MODE != PosEncodingMode::kNone ||
               !std::is_same_v<DTypeQKAccum_, float>)));
   }
 
@@ -1158,10 +1162,11 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
   constexpr uint32_t ROW_BYTES_Q = HEAD_DIM_QK / 2;
   constexpr uint32_t SF_COLS = HEAD_DIM_QK / NVFP4_SF_VEC_SIZE;
   static_assert(is_fp4_type_v<typename KTraits::DTypeKV>, "nvf4 QK requires fp4 KV");
-  static_assert(HEAD_DIM_QK == 128, "A4Q v1 supports head_dim_qk == 128 only");
+  static_assert(HEAD_DIM_QK == 128 || HEAD_DIM_QK == 256 || HEAD_DIM_QK == 512,
+                "A4Q supports head_dim_qk in {128, 256, 512} (2/4/8 k64 blocks)");
   static_assert(NUM_MMA_KV % 2 == 0, "nvf4 QK issues MMAs in n32 (2 x n16) pairs");
   static_assert(KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B,
-                "fp4 KV at head_dim 128 uses the k128B swizzle");
+                "fp4 KV at head_dim >= 128 uses the k128B swizzle");
   const uint8_t* q_sf_smem = q_smem_bytes + KTraits::CTA_TILE_Q * ROW_BYTES_Q;
   const uint8_t* k_smem_bytes = reinterpret_cast<const uint8_t*>(k_smem->base);
 

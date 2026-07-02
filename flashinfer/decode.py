@@ -923,6 +923,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        use_nvf4_qk: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1198,6 +1199,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                if use_nvf4_qk:
+                    # A4Q decode (J-3): nvf4 QK MMA constraints (tensor-core
+                    # decode reuses the batch-prefill modules).
+                    if self._backend != "fa2":
+                        raise ValueError(
+                            "use_nvf4_qk is only supported on the fa2 backend"
+                        )
+                    if pos_encoding_mode != "NONE":
+                        raise ValueError(
+                            "use_nvf4_qk requires pos_encoding_mode == 'NONE'"
+                        )
+                    if head_dim not in (128, 256):
+                        raise ValueError(
+                            "use_nvf4_qk decode requires head_dim in {128, 256}"
+                        )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1210,6 +1226,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_nvf4_qk,
                 )
 
             args = [
@@ -1277,6 +1294,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         self._q_len_per_req = q_len_per_req
+        self._use_nvf4_qk = use_nvf4_qk
 
     begin_forward = plan
 
@@ -1369,6 +1387,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
+        q_sf: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1455,6 +1474,24 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        nvf4_head_dim_qk = None
+        if getattr(self, "_use_nvf4_qk", False):
+            # A4Q decode (J-3): q is packed e2m1 uint8 [tokens, num_qo_heads,
+            # head_dim // 2] with q_sf ue4m3 bytes [tokens, num_qo_heads,
+            # head_dim // 16]. A bf16/fp16 q without q_sf is quantized on the
+            # fly with the CUDA op. The packed codes are reinterpreted as the
+            # planned 16-bit q dtype; the kernel reads raw bytes.
+            if q_sf is None and q.dtype in (torch.bfloat16, torch.float16):
+                from .quantization.fp4_quantization import nvfp4_quantize_q_cuda
+
+                q, q_sf = nvfp4_quantize_q_cuda(q)
+            if q.dtype != torch.uint8:
+                raise ValueError("use_nvf4_qk expects q as packed uint8 e2m1 codes")
+            if q_sf is None or q_sf.dtype != torch.uint8:
+                raise ValueError("use_nvf4_qk requires q_sf as uint8 (ue4m3 bytes)")
+            nvf4_head_dim_qk = q.shape[-1] * 2
+            q = q.contiguous().view(self._cached_q_data_type)
+            q_sf = q_sf.contiguous()
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
         if (
@@ -1525,7 +1562,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
-            head_dim = q.shape[-1]
+            head_dim = (
+                nvf4_head_dim_qk if nvf4_head_dim_qk is not None else q.shape[-1]
+            )
             sm_scale = 1.0 / math.sqrt(head_dim)
         if q_scale is not None:
             sm_scale *= q_scale
@@ -1568,7 +1607,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         else:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
-            check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
+            # A4Q (packed q): q's last dim is the packed byte view, out uses the
+            # unpacked VO width derived from the KV cache.
+            out_head_dim = (
+                v_cache.shape[-1] * 2
+                if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+                else v_cache.shape[-1]
+            )
+            expected_out_shape = (
+                q.shape[:-1] + (out_head_dim,)
+                if nvf4_head_dim_qk is not None
+                else q.shape
+            )
+            check_shape_dtype_device(out, expected_out_shape, out_dtype, q.device, "out")
 
         if self._backend == "cute-dsl":
             if sinks is not None:
@@ -1701,6 +1752,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         value_block_scales,
                         skip_softmax_threshold_scale_factor,
                         True,  # uses_shared_paged_kv_idx
+                        q_sf,  # maybe_q_sf (A4Q nvf4 QK)
                     ]
 
             self._cached_module.paged_run(*run_args)

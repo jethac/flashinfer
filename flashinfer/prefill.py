@@ -2234,8 +2234,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         raise ValueError("use_nvf4_qk is only supported on the fa2 backend")
                     if pos_encoding_mode != "NONE":
                         raise ValueError("use_nvf4_qk requires pos_encoding_mode == 'NONE'")
-                    if head_dim_qk != 128 or head_dim_vo != 128:
-                        raise ValueError("use_nvf4_qk requires head_dim 128 (v1 scope)")
+                    if head_dim_qk not in (128, 256, 512) or head_dim_vo not in (
+                        128,
+                        256,
+                    ):
+                        raise ValueError(
+                            "use_nvf4_qk requires head_dim_qk in {128, 256, 512} "
+                            "and head_dim_vo in {128, 256}"
+                        )
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
@@ -2308,11 +2314,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
-                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type
+                if (
+                    not disable_split_kv
+                    and not use_nvf4_qk
+                    and _nvfp4_kv_requires_disabled_split_kv(kv_data_type)
                 ):
-                    # NVFP4 split-KV corrupts prefix-cached / decode reads; force
-                    # it off. See _nvfp4_kv_requires_disabled_split_kv for why.
+                    # NVFP4 split-KV corrupted prefix-cached / decode reads; the
+                    # root cause was the uninitialized-lse merge read fixed in
+                    # d1fd883f (KV block scales are per-16 HEAD-DIM elements, so
+                    # token-granular chunk boundaries never split a scale block).
+                    # A4Q (J-3) re-enables split-KV behind use_nvf4_qk, validated
+                    # by the J-3 decode ladder; the legacy fp4 path stays gated
+                    # pending its own revalidation.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas

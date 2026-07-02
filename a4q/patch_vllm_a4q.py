@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""A4Q-WIRE: env-gated nvf4 block-scaled QK MMA for the fa2-nvfp4 KV PREFILL path
-(VLLM_NVFP4_A4Q=1). Decode stays on the current path (A4Q v1 scope decision).
+"""A4Q-WIRE: env-gated nvf4 block-scaled QK MMA for the fa2-nvfp4 KV path
+(VLLM_NVFP4_A4Q=1). Two idempotent stages:
+  V1 (marker A4Q-WIRE):   prefill wiring (K-6).
+  V2 (marker A4Q-WIRE-V2): J-3 decode wiring (fast_plan_decode -> decode wrapper
+      plan use_nvf4_qk; split-KV re-enable rides the fork flag) + J-3b wide-head
+      gate relax (head_dim {128,256,512}, incl. the VO-split 512/256 dispatch;
+      a4q_decode covers symmetric head_dim {128,256}).
 
 Patches the installed vllm/v1/attention/backends/flashinfer.py (idempotent;
-marker A4Q-WIRE). Usage: python patch_vllm_a4q.py <path-to-flashinfer.py>
+each stage applies once). Usage: python patch_vllm_a4q.py <path-to-flashinfer.py>
 
 Wiring summary:
 - _fa2_nvfp4_prefill_jit_args grows use_nvf4_qk: appends the maybe_q_sf
@@ -30,9 +35,6 @@ import sys
 
 path = sys.argv[1]
 src = open(path, encoding="utf-8").read()
-if "A4Q-WIRE" in src:
-    print("ALREADY PATCHED")
-    sys.exit(0)
 assert "K0B-QF16" in src, "expected the K0B-QF16 patch to be applied first"
 
 
@@ -41,6 +43,80 @@ def rep(old, new, n=1):
     cnt = src.count(old)
     assert cnt == n, f"anchor x{n} expected, found x{cnt}: {old[:80]!r}"
     src = src.replace(old, new)
+
+
+def apply_v2():
+    # --- V2.1 wide-head gate relax (J-3b) + a4q_decode flag (J-3) ------------
+    rep(
+        "            and self.head_dim == 128\n"
+        "            and self.vo_split == 1\n"
+        "            and not self.use_dcp\n"
+        "        )\n",
+        "            and self.head_dim in (128, 256, 512)  # A4Q-WIRE-V2\n"
+        "            and (\n"
+        "                self.vo_split == 1\n"
+        "                or (self.head_dim == 512 and self.vo_split == 2)\n"
+        "            )\n"
+        "            and not self.use_dcp\n"
+        "        )\n"
+        "        # A4Q-WIRE-V2 (J-3): decode wrapper (tensor-core fa2 route)\n"
+        "        # supports symmetric head_dim {128, 256}; VO-split geometries\n"
+        "        # route decodes through the prefill wrapper already.\n"
+        "        self.a4q_decode = (\n"
+        "            self.a4q_prefill\n"
+        "            and self.head_dim in (128, 256)\n"
+        "            and self.vo_split == 1\n"
+        "        )\n",
+    )
+    # --- V2.2 fast_plan_decode threading -------------------------------------
+    rep(
+        "    fixed_split_size: int = -1,\n"
+        "    disable_split_kv: bool = False,\n"
+        ") -> None:\n"
+        '    """\n'
+        "    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan",
+        "    fixed_split_size: int = -1,\n"
+        "    disable_split_kv: bool = False,\n"
+        "    use_nvf4_qk: bool = False,  # A4Q-WIRE-V2\n"
+        ") -> None:\n"
+        '    """\n'
+        "    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan",
+    )
+    rep(
+        "            fixed_split_size=fixed_split_size,\n"
+        "            disable_split_kv=disable_split_kv,\n"
+        "        )\n"
+        "        self.vllm_first_call = False\n"
+        "        return\n",
+        "            fixed_split_size=fixed_split_size,\n"
+        "            disable_split_kv=disable_split_kv,\n"
+        "            use_nvf4_qk=use_nvf4_qk,  # A4Q-WIRE-V2\n"
+        "        )\n"
+        "        self.vllm_first_call = False\n"
+        "        return\n",
+    )
+    rep(
+        "                    fixed_split_size=self.decode_fixed_split_size,\n"
+        "                    disable_split_kv=self.disable_split_kv,\n"
+        "                )\n"
+        "                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)",
+        "                    fixed_split_size=self.decode_fixed_split_size,\n"
+        "                    disable_split_kv=self.disable_split_kv,\n"
+        "                    use_nvf4_qk=self.a4q_decode,  # A4Q-WIRE-V2\n"
+        "                )\n"
+        "                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)",
+    )
+
+
+if "A4Q-WIRE-V2" in src:
+    print("ALREADY PATCHED (V1+V2)")
+    sys.exit(0)
+if "A4Q-WIRE" in src:
+    apply_v2()
+    ast.parse(src)
+    open(path, "w", encoding="utf-8").write(src)
+    print("PATCHED A4Q-WIRE-V2 (decode wiring + wide-head gates on existing V1)")
+    sys.exit(0)
 
 
 # --- 1. env helper + jit-args builder ---------------------------------------
@@ -218,10 +294,13 @@ rep(
     "                        )",
 )
 
+apply_v2()
+
 ast.parse(src)
 open(path, "w", encoding="utf-8").write(src)
 print(
-    "PATCHED A4Q-WIRE (jit args + builder flag + QF16 precedence x2 + "
-    "wrapper ctor + 2 plan sites; forward untouched - the fork wrapper "
-    "auto-quantizes q via nvfp4_quantize_q_cuda)"
+    "PATCHED A4Q-WIRE + A4Q-WIRE-V2 (V1: jit args + builder flag + QF16 "
+    "precedence x2 + wrapper ctor + 2 plan sites; V2: decode wiring + "
+    "wide-head gates; forward untouched - the fork wrappers auto-quantize "
+    "q via nvfp4_quantize_q_cuda)"
 )
