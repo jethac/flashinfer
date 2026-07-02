@@ -27,6 +27,7 @@ from ..core import (
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
+    sm120a_nvcc_flags,
     current_compilation_context,
 )
 from ...jit.cubin_loader import get_artifact, get_meta_hash
@@ -332,6 +333,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_nvf4_qk: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -342,7 +344,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_nvf4qk_True" if use_nvf4_qk else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -388,6 +392,7 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_nvf4_qk: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -399,7 +404,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_nvf4qk_True" if use_nvf4_qk else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -504,6 +511,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_nvf4_qk: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -516,6 +524,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_nvf4_qk,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -532,6 +541,10 @@ def gen_single_prefill_module(
             "maybe_v_cache_sf",
         ]
         additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
+        if use_nvf4_qk:
+            # A4Q: packed-Q per-16 scale factors (ue4m3 bytes).
+            additional_tensor_names.append("maybe_q_sf")
+            additional_tensor_dtypes.append("uint8_t")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -585,6 +598,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_nvf4_qk=use_nvf4_qk,
     )
 
 
@@ -977,6 +991,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_nvf4_qk: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -990,6 +1005,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_nvf4_qk,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1026,6 +1042,10 @@ def gen_batch_prefill_module(
             "uint8_t",
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        if use_nvf4_qk:
+            # A4Q: packed-Q per-16 scale factors (ue4m3 bytes).
+            additional_tensor_names.append("maybe_q_sf")
+            additional_tensor_dtypes.append("uint8_t")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -1091,6 +1111,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_nvf4_qk=use_nvf4_qk,
     )
 
 
@@ -1315,6 +1336,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_nvf4_qk: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1328,6 +1350,7 @@ def gen_customize_single_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_nvf4_qk": str(use_nvf4_qk).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1388,10 +1411,15 @@ def gen_customize_single_prefill_module(
         generated_config_path = gen_directory / "single_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
 
+        extra_cuda_cflags = _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo)
+        if use_nvf4_qk:
+            # A4Q: the nvf4 block-scaled MMA is sm_120a/121a-specific; compile this
+            # module for sm_120a only and enable the inline-PTX path.
+            extra_cuda_cflags = sm120a_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=extra_cuda_cflags,
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1568,8 +1596,16 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_nvf4_qk: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if use_nvf4_qk:
+        if not require_fp4_kv_cache:
+            raise ValueError("use_nvf4_qk requires an NVFP4 (packed uint8) KV cache dtype")
+        if "maybe_q_sf" not in additional_tensor_names:
+            raise ValueError(
+                "use_nvf4_qk JIT modules require the maybe_q_sf additional tensor"
+            )
     if require_fp4_kv_cache:
         missing_sf_tensors = [
             name
@@ -1597,6 +1633,7 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_nvf4_qk": str(use_nvf4_qk).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1675,6 +1712,10 @@ def gen_customize_batch_prefill_module(
         extra_cuda_cflags = _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo)
         if kwargs["require_fp4_kv_cache"]:
             extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
+        if use_nvf4_qk:
+            # A4Q: the nvf4 block-scaled MMA is sm_120a/121a-specific; compile this
+            # module for sm_120a only and enable the inline-PTX path.
+            extra_cuda_cflags = sm120a_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
         return gen_jit_spec(
             uri,
             source_paths,

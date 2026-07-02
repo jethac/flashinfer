@@ -101,6 +101,49 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
+_E2M1_GRID = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def nvfp4_quantize_q(q: torch.Tensor):
+    r"""A4Q: quantize Q to packed e2m1 codes with per-16 ue4m3 scale factors.
+
+    Per 16 consecutive elements along the last (head) dimension:
+    ``sf = e4m3(amax / 6)``, codes = round-to-nearest e2m1 of ``q / sf``,
+    packed 2 codes per byte (low nibble = even element). This matches the
+    K-3-validated quantization used by the nvf4 QK MMA path bit-exactly.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor ``[..., head_dim]`` (float16/bfloat16/float32), head_dim % 16 == 0.
+
+    Returns
+    -------
+    (packed, sf, deq) :
+        ``packed`` uint8 ``[..., head_dim // 2]``,
+        ``sf`` uint8 (e4m3 bytes) ``[..., head_dim // 16]``,
+        ``deq`` float32 dequantized reference with the same shape as ``q``.
+    """
+    grid = torch.tensor(_E2M1_GRID, device=q.device, dtype=torch.float32)
+    shape = q.shape
+    D = shape[-1]
+    assert D % 16 == 0, "head_dim must be a multiple of 16"
+    x = q.float().reshape(-1, D // 16, 16)
+    amax = x.abs().amax(-1, keepdim=True).clamp_min(1e-6)
+    sf = (amax / 6.0).to(torch.float8_e4m3fn)
+    sf_f = sf.float()
+    y = x / sf_f
+    sgn = y.sign()
+    idx = (y.abs().clamp(max=6.0).unsqueeze(-1) - grid).abs().argmin(-1)
+    codes = torch.where(sgn < 0, idx + 8, idx).to(torch.uint8).reshape(-1, D)
+    packed = (
+        (codes[:, 0::2] | (codes[:, 1::2] << 4)).reshape(*shape[:-1], D // 2).contiguous()
+    )
+    deq = (sgn * grid[idx] * sf_f).reshape(shape)
+    sf_u8 = sf.view(torch.uint8).reshape(*shape[:-1], D // 16).contiguous()
+    return packed, sf_u8, deq
+
+
 @functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
@@ -318,6 +361,8 @@ def get_single_prefill_module(backend, *args):
     uri = get_single_prefill_uri(backend, *args)
     module = gen_single_prefill_module(backend, *args).build_and_load()
     run_func = module.run
+    # A4Q: trailing use_nvf4_qk arg (optional for backward compat with 9-arg callers)
+    use_nvf4_qk = args[9] if len(args) > 9 else False
 
     # torch library for single_prefill_with_kv_cache
 
@@ -345,6 +390,7 @@ def get_single_prefill_module(backend, *args):
         rope_theta: float,
         maybe_k_cache_sf: Optional[torch.Tensor] = None,
         maybe_v_cache_sf: Optional[torch.Tensor] = None,
+        maybe_q_sf: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "fa3":
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -387,7 +433,7 @@ def get_single_prefill_module(backend, *args):
                     scale_v_scalar,
                 )
         else:
-            run_func(
+            fa2_args = [
                 q,
                 k,
                 v,
@@ -401,11 +447,16 @@ def get_single_prefill_module(backend, *args):
                 maybe_alibi_slopes,
                 maybe_k_cache_sf,
                 maybe_v_cache_sf,
+            ]
+            if use_nvf4_qk:
+                fa2_args.append(maybe_q_sf)
+            fa2_args += [
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
-            )
+            ]
+            run_func(*fa2_args)
         return o
 
     @register_fake_op(f"flashinfer::{uri}_run")
@@ -427,6 +478,7 @@ def get_single_prefill_module(backend, *args):
         rope_theta: float,
         maybe_k_cache_sf: Optional[torch.Tensor] = None,
         maybe_v_cache_sf: Optional[torch.Tensor] = None,
+        maybe_q_sf: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -448,6 +500,8 @@ def get_batch_prefill_module(backend, *args):
         plan_func = module.plan
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
+    # A4Q: trailing use_nvf4_qk arg (optional for backward compat with 10-arg callers)
+    use_nvf4_qk = args[10] if len(args) > 10 else False
 
     # torch library for ragged_run
 
@@ -491,12 +545,13 @@ def get_batch_prefill_module(backend, *args):
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
+        maybe_q_sf: Optional[torch.Tensor] = None,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
 
         if backend == "fa2":
-            ragged_run_func(
+            fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -519,12 +574,18 @@ def get_batch_prefill_module(backend, *args):
                 maybe_max_item_len_ptr,
                 maybe_k_cache_sf,
                 maybe_v_cache_sf,
+            ]
+            if use_nvf4_qk:
+                # A4Q module signatures carry maybe_q_sf after the KV SF tensors.
+                fa2_args.append(maybe_q_sf)
+            fa2_args += [
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
-            )
+            ]
+            ragged_run_func(*fa2_args)
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
             scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
@@ -676,6 +737,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        maybe_q_sf: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -717,7 +779,7 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -742,12 +804,18 @@ def get_batch_prefill_module(backend, *args):
                 maybe_max_item_len_ptr,
                 key_block_scales,
                 value_block_scales,
+            ]
+            if use_nvf4_qk:
+                # A4Q module signatures carry maybe_q_sf after the KV SF tensors.
+                fa2_args.append(maybe_q_sf)
+            fa2_args += [
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
-            )
+            ]
+            paged_run_func(*fa2_args)
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             if not is_float8(q):
@@ -1171,6 +1239,8 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_nvf4_qk: bool = False,
+    q_sf: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1309,8 +1379,32 @@ def single_prefill_with_kv_cache(
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
+    # A4Q (use_nvf4_qk): q is packed e2m1 uint8 [qo_len, num_qo_heads, head_dim // 2]
+    # with q_sf ue4m3 bytes [qo_len, num_qo_heads, head_dim // 16]. The packed tensor is
+    # reinterpreted as a 16-bit view so the fa2 module (DTypeQ stays bf16/fp16 for the PV
+    # stage) can consume it; the kernel reads it as raw bytes.
+    nvf4_head_dim_qk = None
+    if use_nvf4_qk:
+        if q.dtype != torch.uint8:
+            raise ValueError("use_nvf4_qk expects q as packed uint8 e2m1 codes")
+        if q_sf is None or q_sf.dtype != torch.uint8:
+            raise ValueError("use_nvf4_qk requires q_sf as uint8 (ue4m3 bytes)")
+        if kv_cache_sf is None:
+            raise ValueError("use_nvf4_qk requires an NVFP4 KV cache (kv_cache_sf)")
+        if pos_encoding_mode != "NONE":
+            raise ValueError("use_nvf4_qk requires pos_encoding_mode == 'NONE'")
+        if backend not in ("auto", "fa2"):
+            raise ValueError("use_nvf4_qk is only supported on the fa2 backend")
+        backend = "fa2"
+        nvf4_head_dim_qk = q.shape[-1] * 2
+        q = q.contiguous().view(torch.bfloat16)
+        q_sf = q_sf.contiguous()
+        if o_dtype is None:
+            o_dtype = torch.bfloat16
     if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(q.size(-1))
+        sm_scale = 1.0 / math.sqrt(
+            nvf4_head_dim_qk if nvf4_head_dim_qk is not None else q.size(-1)
+        )
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
@@ -1385,12 +1479,13 @@ def single_prefill_with_kv_cache(
         q.dtype,
         k.dtype,
         out.dtype,
-        q.shape[-1],  # head_dim_qk
+        nvf4_head_dim_qk if nvf4_head_dim_qk is not None else q.shape[-1],  # head_dim_qk
         out_head_dim,  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        use_nvf4_qk,
     )
 
     module.run(
@@ -1416,6 +1511,7 @@ def single_prefill_with_kv_cache(
         rope_theta,
         k_sf,
         v_sf,
+        q_sf,
     )
 
     is_float_one = isinstance(v_scale, float) and v_scale == 1.0
@@ -1828,6 +1924,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_nvf4_qk: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2112,6 +2209,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     kv_data_type,
                 )
             if self._backend != "cudnn":
+                if use_nvf4_qk:
+                    # A4Q: nvf4 QK MMA prototype constraints.
+                    if self._backend != "fa2":
+                        raise ValueError("use_nvf4_qk is only supported on the fa2 backend")
+                    if pos_encoding_mode != "NONE":
+                        raise ValueError("use_nvf4_qk requires pos_encoding_mode == 'NONE'")
+                    if head_dim_qk != 128 or head_dim_vo != 128:
+                        raise ValueError("use_nvf4_qk requires head_dim 128 (v1 scope)")
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
@@ -2123,6 +2228,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    use_nvf4_qk,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -2198,6 +2304,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
+        self._use_nvf4_qk = use_nvf4_qk
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -2293,6 +2400,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        q_sf: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2380,6 +2488,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        nvf4_head_dim_qk = None
+        if getattr(self, "_use_nvf4_qk", False):
+            # A4Q: q is packed e2m1 uint8 [tokens, num_qo_heads, head_dim // 2] with
+            # q_sf ue4m3 bytes [tokens, num_qo_heads, head_dim // 16]. Reinterpret the
+            # packed codes as the planned 16-bit q dtype; the kernel reads raw bytes.
+            if q.dtype != torch.uint8:
+                raise ValueError("use_nvf4_qk expects q as packed uint8 e2m1 codes")
+            if q_sf is None or q_sf.dtype != torch.uint8:
+                raise ValueError("use_nvf4_qk requires q_sf as uint8 (ue4m3 bytes)")
+            nvf4_head_dim_qk = q.shape[-1] * 2
+            q = q.contiguous().view(self._cached_q_data_type)
+            q_sf = q_sf.contiguous()
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -2432,7 +2552,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
-            sm_scale = 1.0 / math.sqrt(q.size(-1))
+            sm_scale = 1.0 / math.sqrt(
+                nvf4_head_dim_qk if nvf4_head_dim_qk is not None else q.size(-1)
+            )
         if self._backend != "cudnn":
             if q_scale is not None:
                 sm_scale *= q_scale
@@ -2634,6 +2756,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    q_sf,  # maybe_q_sf (A4Q nvf4 QK)
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
