@@ -77,6 +77,9 @@ jobs:
       - name: Install torch (CPU) + flashinfer editable
         run: |
           set -euxo pipefail
+          # pyproject uses SPDX license strings -> setuptools>=77 required,
+          # and --no-build-isolation builds with the PREINSTALLED setuptools.
+          pip install -U "setuptools>=77" packaging wheel ninja
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-build-isolation -e . -v
           python -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
