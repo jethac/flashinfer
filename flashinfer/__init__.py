@@ -76,6 +76,7 @@ from .quantization.fp4_quantization import (
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
     nvfp4_kv_quantize,
+    nvfp4_quantize_q_cuda,
 )
 from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (

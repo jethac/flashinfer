@@ -105,12 +105,17 @@ _E2M1_GRID = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
 def nvfp4_quantize_q(q: torch.Tensor):
-    r"""A4Q: quantize Q to packed e2m1 codes with per-16 ue4m3 scale factors.
+    r"""A4Q: torch reference for Q quantization to packed e2m1 codes with per-16
+    ue4m3 scale factors (see :func:`flashinfer.nvfp4_quantize_q_cuda` for the
+    fast CUDA op with identical semantics).
 
     Per 16 consecutive elements along the last (head) dimension:
-    ``sf = e4m3(amax / 6)``, codes = round-to-nearest e2m1 of ``q / sf``,
-    packed 2 codes per byte (low nibble = even element). This matches the
-    K-3-validated quantization used by the nvf4 QK MMA path bit-exactly.
+    ``sf = e4m3(amax / 6)`` (amax clamped to >= 1e-6), codes =
+    round-to-nearest-EVEN e2m1 of ``q / sf`` (matching PTX
+    ``cvt.rn.satfinite.e2m1x2.f32`` semantics, including ties at |y| in
+    {0.75, 1.75, 3.5} rounding to the even code), packed 2 codes per byte
+    (low nibble = even element). Blocks whose sf underflows e4m3 to 0 emit
+    all-zero codes (their dequantized contribution is 0 either way).
 
     Parameters
     ----------
@@ -132,9 +137,16 @@ def nvfp4_quantize_q(q: torch.Tensor):
     amax = x.abs().amax(-1, keepdim=True).clamp_min(1e-6)
     sf = (amax / 6.0).to(torch.float8_e4m3fn)
     sf_f = sf.float()
-    y = x / sf_f
+    y = torch.where(sf_f == 0, torch.zeros_like(x), x / sf_f)
     sgn = y.sign()
-    idx = (y.abs().clamp(max=6.0).unsqueeze(-1) - grid).abs().argmin(-1)
+    ya = y.abs().clamp(max=6.0)
+    idx = (ya.unsqueeze(-1) - grid).abs().argmin(-1)
+    # Round-to-nearest-even at exact e2m1 midpoints (cvt.rn semantics): argmin
+    # picks the smaller-magnitude code, but RNE rounds 0.75->1.0, 1.75->2.0 and
+    # 3.5->4.0 (the other midpoints 0.25/1.25/2.5/5.0 already land on even codes).
+    idx = torch.where(ya == 0.75, torch.full_like(idx, 2), idx)
+    idx = torch.where(ya == 1.75, torch.full_like(idx, 4), idx)
+    idx = torch.where(ya == 3.5, torch.full_like(idx, 6), idx)
     codes = torch.where(sgn < 0, idx + 8, idx).to(torch.uint8).reshape(-1, D)
     packed = (
         (codes[:, 0::2] | (codes[:, 1::2] << 4)).reshape(*shape[:-1], D // 2).contiguous()
@@ -1385,6 +1397,11 @@ def single_prefill_with_kv_cache(
     # stage) can consume it; the kernel reads it as raw bytes.
     nvf4_head_dim_qk = None
     if use_nvf4_qk:
+        # A bf16/fp16 q without q_sf is quantized on the fly with the CUDA op.
+        if q_sf is None and q.dtype in (torch.bfloat16, torch.float16):
+            from .quantization.fp4_quantization import nvfp4_quantize_q_cuda
+
+            q, q_sf = nvfp4_quantize_q_cuda(q)
         if q.dtype != torch.uint8:
             raise ValueError("use_nvf4_qk expects q as packed uint8 e2m1 codes")
         if q_sf is None or q_sf.dtype != torch.uint8:
@@ -2491,8 +2508,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         nvf4_head_dim_qk = None
         if getattr(self, "_use_nvf4_qk", False):
             # A4Q: q is packed e2m1 uint8 [tokens, num_qo_heads, head_dim // 2] with
-            # q_sf ue4m3 bytes [tokens, num_qo_heads, head_dim // 16]. Reinterpret the
-            # packed codes as the planned 16-bit q dtype; the kernel reads raw bytes.
+            # q_sf ue4m3 bytes [tokens, num_qo_heads, head_dim // 16]. A bf16/fp16 q
+            # without q_sf is quantized on the fly with the CUDA op. The packed codes
+            # are reinterpreted as the planned 16-bit q dtype; the kernel reads raw
+            # bytes.
+            if q_sf is None and q.dtype in (torch.bfloat16, torch.float16):
+                from .quantization.fp4_quantization import nvfp4_quantize_q_cuda
+
+                q, q_sf = nvfp4_quantize_q_cuda(q)
             if q.dtype != torch.uint8:
                 raise ValueError("use_nvf4_qk expects q as packed uint8 e2m1 codes")
             if q_sf is None or q_sf.dtype != torch.uint8:
