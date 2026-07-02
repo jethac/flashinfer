@@ -243,6 +243,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_nvf4_qk: bool = False,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -264,6 +265,7 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        use_nvf4_qk,
     ).build_and_load()
 
 
@@ -2712,6 +2714,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "maybe_max_item_len_ptr": self._max_item_len_ptr,
                         "maybe_k_cache_sf": key_block_scales,
                         "maybe_v_cache_sf": value_block_scales,
+                        "maybe_q_sf": q_sf,  # A4Q nvf4 QK
                     },
                     args,
                 )
