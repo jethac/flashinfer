@@ -9,7 +9,7 @@ import torch
 
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
-_SUPPORTED_ACTIVATIONS = {"silu", "relu2"}
+_SUPPORTED_ACTIVATIONS = {"silu", "relu2", "gelu_tanh"}
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,7 @@ class W4A16BufferPlan:
 def validate_activation(activation: str) -> bool:
     if activation not in _SUPPORTED_ACTIVATIONS:
         raise ValueError(f"unsupported activation {activation!r}")
-    return activation == "silu"
+    return activation in ("silu", "gelu_tanh")
 
 
 def validate_w4a16_packed_inputs(
