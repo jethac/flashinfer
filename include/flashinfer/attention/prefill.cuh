@@ -664,9 +664,17 @@ __device__ __forceinline__ void page_produce_kv_sf(
       const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
       constexpr auto fill_mode =
           produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-                                         reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                         in_bounds);
+      // Guard the buffer bound: NUM_SF_ITERS rounds up, so the last iter has lanes with
+      // flat_byte >= SF_TOTAL_BYTES. With kFillZero the store is UNCONDITIONAL (fires even
+      // when the predicate is false), so an unguarded store would write 4 bytes past sf_smem
+      // (e.g. head_dim_vo=128, NUM_MMA_KV=2 -> SF_TOTAL_BYTES/4 not a multiple of THREADS_PER_CTA).
+      // Mirror the FLASHINFER_PAGED_V_SF_DESWIZZLE branch's guard; in-buffer padding rows
+      // (flat_byte < SF_TOTAL_BYTES, in_bounds false) are still zero-filled by kFillZero.
+      if (flat_byte < SF_TOTAL_BYTES) {
+        cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+                                           reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
+                                           in_bounds);
+      }
     }
   }
 }
@@ -730,9 +738,15 @@ __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* s
     // Same rationale as page_produce_kv_sf: zero-fill V SF to prevent 0*NaN=NaN in compute_sfm_v.
     constexpr auto fill_mode =
         produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-    cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-                                       reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                       in_bounds);
+    // Guard the buffer bound: with kFillZero the store is UNCONDITIONAL, so lanes in the
+    // rounded-up last iter with flat_byte >= SF_TOTAL_BYTES would write 4 bytes past sf_smem
+    // (OOB __shared__ write, memcheck-confirmed at head_dim_vo=128 / NUM_MMA_KV=2). In-buffer
+    // padding rows (flat_byte < SF_TOTAL_BYTES, in_bounds false) are still zero-filled.
+    if (flat_byte < SF_TOTAL_BYTES) {
+      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+                                         reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
+                                         in_bounds);
+    }
   }
 }
 
