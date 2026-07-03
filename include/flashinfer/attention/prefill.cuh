@@ -98,7 +98,7 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
-          bool kEnableVOSplitOpt = false>
+          bool kEnableVOSplitOpt = false, bool USE_NVF4_QK_ = false>
 struct SharedStorageQKVO {
   static constexpr bool kKVShareShape =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
@@ -110,10 +110,18 @@ struct SharedStorageQKVO {
   static constexpr bool kVShareActive = kKVShareShape && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                         (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
+  // J-5: A4Q dense-packs the fp4 K tile (16 e2m1 codes = 8 payload bytes stored
+  // in an 8B stride, not the half-empty 16B slot), halving k_smem so the CTA hits
+  // 2 CTAs/SM. Only the nvf4-QK path reads K via compute_qk_nvf4's manual
+  // addressing, so densifying is a pure layout move (bit-exact). K row is a
+  // contiguous HEAD_DIM_QK/2-byte packed run (row-major, no swizzle).
+  static constexpr bool kDenseKFp4 = USE_NVF4_QK_ && is_fp4_type_v<DTypeKV>;
+  static constexpr uint32_t kKSmemElems =
+      kDenseKFp4 ? (CTA_TILE_KV * HEAD_DIM_QK / 2) : (CTA_TILE_KV * HEAD_DIM_QK);
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
-      alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK];
+      alignas(16) DTypeKV k_smem[kKSmemElems];
       alignas(16)
           std::conditional_t<kVShareActive, DTypeKV[1], DTypeKV[CTA_TILE_KV * HEAD_DIM_VO]> v_smem;
     };
@@ -229,11 +237,12 @@ struct KernelTraits {
               !std::is_same_v<DTypeQKAccum_, float>)));
   }
 
-  using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
-                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+  using SharedStorage =
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ,
+                        DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/false, USE_NVF4_QK>;
   using SharedStoragePaged =
       SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ,
-                        DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/true>;
+                        DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/true, USE_NVF4_QK>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -381,6 +390,31 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
       produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
   const uint32_t warp_idx = get_warp_idx<KTraits>(tid.y, tid.z), lane_idx = tid.x;
 
+  // J-5: dense-pack the fp4 K tile (single/ragged path). Contiguous row-major smem
+  // (HEAD_DIM_QK/2 bytes/row); reuses the running GMEM pointer + 64b cp.async, only
+  // the smem destination changes. See page_produce_kv for the derivation.
+  if constexpr (KTraits::USE_NVF4_QK && IS_FP4 && !produce_v) {
+    constexpr uint32_t ROW_BYTES = KTraits::HEAD_DIM_QK / 2;
+    constexpr uint32_t NUM_D_ITERS = NUM_MMA_D / (8 / sizeof(DTypeKV));
+    uint8_t* dense_base = reinterpret_cast<uint8_t*>(smem.base);
+    const uint32_t L = lane_idx % 8;
+    const uint32_t row0 = warp_idx * 4 + lane_idx / 8;
+    uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
+    static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
+#pragma unroll
+    for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
+      uint8_t* drow = dense_base + (row0 + i * NUM_WARPS * 4) * ROW_BYTES;
+#pragma unroll
+      for (uint32_t j = 0; j < NUM_D_ITERS; ++j) {
+        cp_async::pred_load_128b_from_64b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
+            reinterpret_cast<DTypeKV*>(drow + j * 64 + L * 8), *gptr, kv_idx < kv_len);
+        *gptr += 4 * upcast_size<DTypeKV>();
+      }
+      kv_idx += NUM_WARPS * 4;
+      *gptr += NUM_WARPS * 4 * stride_n - 4 * upcast_size<DTypeKV>() * NUM_D_ITERS;
+    }
+    return;
+  }
   if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
@@ -452,6 +486,34 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
   // Use a 64b async load (cp.async with src-size=8) and advance GMEM pointer by half the normal
   // amount, while SMEM addressing remains unchanged.
   constexpr bool IS_FP4 = is_fp4_type_v<DType>;
+  // J-5: dense-pack the fp4 K tile. Store each K row as a contiguous HEAD_DIM_QK/2
+  // byte run (row-major, no swizzle) instead of half-empty 16B slots, so k_smem
+  // halves and the CTA reaches 2 CTAs/SM. Reuses the exact k128B thread mapping,
+  // GMEM offsets, and 64b cp.async (cp-size 8 -> writes exactly 8 bytes, no
+  // neighbor clobber); only the SMEM destination byte offset changes. Read side is
+  // compute_qk_nvf4's dense addressing (bit-exact vs the half-empty layout).
+  if constexpr (KTraits::USE_NVF4_QK && IS_FP4 && !produce_v) {
+    constexpr uint32_t ROW_BYTES = KTraits::HEAD_DIM_QK / 2;
+    constexpr uint32_t NUM_D_ITERS = NUM_MMA_D / (8 / sizeof(DType));  // 8-chunk groups per row
+    uint8_t* dense_base = reinterpret_cast<uint8_t*>(smem_storage->k_smem);
+    const uint32_t L = lane_idx % 8;                     // feat chunk within a group (8 bytes)
+    const uint32_t row0 = warp_idx * 4 + lane_idx / 8;   // KV_THR_LAYOUT ROW=4, COL=8 (k128B)
+    uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
+    static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
+#pragma unroll
+    for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
+      DType* gptr = kv_ptr + thr_local_kv_offset[i];
+      uint8_t* drow = dense_base + (row0 + i * NUM_WARPS * 4) * ROW_BYTES;
+#pragma unroll
+      for (uint32_t j = 0; j < NUM_D_ITERS; ++j) {
+        cp_async::pred_load_128b_from_64b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
+            reinterpret_cast<DType*>(drow + j * 64 + L * 8), gptr, kv_idx < kv_len);
+        gptr += 4 * upcast_size<DType>();
+      }
+      kv_idx += NUM_WARPS * 4;
+    }
+    return;
+  }
   if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
@@ -1158,8 +1220,8 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
   constexpr uint32_t HEAD_DIM_QK = KTraits::HEAD_DIM_QK;
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-  constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;  // b128 slots per K row
   constexpr uint32_t ROW_BYTES_Q = HEAD_DIM_QK / 2;
+  constexpr uint32_t ROW_BYTES_K = HEAD_DIM_QK / 2;  // J-5: dense fp4 K row stride (bytes)
   constexpr uint32_t SF_COLS = HEAD_DIM_QK / NVFP4_SF_VEC_SIZE;
   static_assert(is_fp4_type_v<typename KTraits::DTypeKV>, "nvf4 QK requires fp4 KV");
   static_assert(HEAD_DIM_QK == 128 || HEAD_DIM_QK == 256 || HEAD_DIM_QK == 512,
@@ -1206,24 +1268,19 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
     // ---- per n32 chunk: B fragments + SFB, then 4 sub-MMAs per mma_q
 #pragma unroll
     for (uint32_t p = 0; p < NUM_MMA_KV / 2; ++p) {
-      // k64 block kb covers slots kb*4 .. kb*4+3 (16 elements per slot). Lane reads 4B at
-      // element offset tr*8 (lo half) / 32+tr*8 (hi half) within the block.
-      const uint32_t slot_lo = kb * 4 + (tr >> 1);
-      const uint32_t byte_in_slot = (tr & 1) * 4;
+      // J-5 dense fp4 K: row-major HEAD_DIM_QK/2 bytes/row (no swizzle). The k64
+      // block kb maps to dense 16B chunks kb*2 (lo, feat elems 0..31 of the block)
+      // and kb*2+1 (hi, elems 32..63); lane reads 4B (8 e2m1) at byte tr*4 within the
+      // chunk. Bit-identical to the old half-empty read: both target feat element
+      // (kb*64 + tr*8) [lo] and (kb*64 + 32 + tr*8) [hi].
+      const uint32_t dbyte = tr * 4;
       uint32_t b[8];
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
         const uint32_t row = warp_kv_row_base + p * 32 + tq + 8 * j;
-        const uint32_t off_lo =
-            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
-                row, slot_lo);
-        const uint32_t off_hi =
-            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
-                row, slot_lo + 2);
-        b[2 * j] =
-            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_lo * 16 + byte_in_slot);
-        b[2 * j + 1] =
-            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_hi * 16 + byte_in_slot);
+        const uint8_t* kr = k_smem_bytes + row * ROW_BYTES_K;
+        b[2 * j] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2) * 16 + dbyte);
+        b[2 * j + 1] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2 + 1) * 16 + dbyte);
       }
       const uint32_t sfb =
           *reinterpret_cast<const uint32_t*>(k_sf_smem + (p * 32 + bn) * SF_COLS + kb * 4);
@@ -1249,22 +1306,14 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
     // overruns into v_sf_smem, worst case a few hundred bytes).
     if constexpr (NUM_MMA_KV % 2 == 1) {
       const uint32_t p = NUM_MMA_KV / 2;
-      const uint32_t slot_lo = kb * 4 + (tr >> 1);
-      const uint32_t byte_in_slot = (tr & 1) * 4;
+      const uint32_t dbyte = tr * 4;  // J-5 dense fp4 K (see n32 chunk above)
       uint32_t b[4];
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
         const uint32_t row = warp_kv_row_base + p * 32 + tq + 8 * j;
-        const uint32_t off_lo =
-            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
-                row, slot_lo);
-        const uint32_t off_hi =
-            smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_K>(
-                row, slot_lo + 2);
-        b[2 * j] =
-            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_lo * 16 + byte_in_slot);
-        b[2 * j + 1] =
-            *reinterpret_cast<const uint32_t*>(k_smem_bytes + off_hi * 16 + byte_in_slot);
+        const uint8_t* kr = k_smem_bytes + row * ROW_BYTES_K;
+        b[2 * j] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2) * 16 + dbyte);
+        b[2 * j + 1] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2 + 1) * 16 + dbyte);
       }
       const uint32_t sfb =
           *reinterpret_cast<const uint32_t*>(k_sf_smem + (p * 32 + bn) * SF_COLS + kb * 4);
@@ -3998,9 +4047,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                              (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr bool kVOSplitDispatch =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+  // J-5: the nvf4-QK path dense-packs the fp4 K tile (half the per-token K smem),
+  // so the occupancy budget counts K at HEAD_DIM_QK/2. V is unchanged.
+  constexpr bool kDenseKFp4 = USE_NVF4_QK && is_fp4_type_v<DTypeKV>;
+  constexpr uint32_t kKDim = kDenseKFp4 ? (HEAD_DIM_QK / 2) : HEAD_DIM_QK;
   constexpr uint32_t kKVSmemPerMmaKV =
-      (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-                 : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
+      (kKVShared ? (kKDim * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                 : ((kKDim + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
