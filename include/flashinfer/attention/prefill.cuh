@@ -1316,8 +1316,13 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
     // spreads rows across lanes ((lane%4)*8 + lane/4); lanes with (lane%4)>=2
     // hold rows 16..31 past the n16 tile, but those lanes only feed the
     // SKIPPED sub-MMAs 2/3 (tidB selects the lane quartet), so their values
-    // are dead. The reads themselves stay inside SharedStorage (k_sf_smem
-    // overruns into v_sf_smem, worst case a few hundred bytes).
+    // are dead. HARDENING: the dead lanes' unclamped SFB read overran k_sf_smem
+    // into v_sf_smem, which is still being written by the in-flight V-SF cp.async
+    // (compute runs after wait_group<1>, so grpB/V-SF is not yet landed) -> a
+    // racecheck WAR hazard on dead data (memcheck-clean, numerically benign, but a
+    // real race). Clamp the tail SFB read into the n16 tile (bn & 15) so it stays
+    // within k_sf_smem; live lanes (bn<16) are unchanged, dead lanes read a valid
+    // duplicate (unused by sub-MMAs 0/1) -> race removed, bit-exactness preserved.
     if constexpr (NUM_MMA_KV % 2 == 1) {
       const uint32_t p = NUM_MMA_KV / 2;
       const uint32_t dbyte = tr * 4;  // J-5 dense fp4 K (see n32 chunk above)
@@ -1329,8 +1334,11 @@ __device__ __forceinline__ void compute_qk_nvf4(const uint8_t* q_smem_bytes,
         b[2 * j] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2) * 16 + dbyte);
         b[2 * j + 1] = *reinterpret_cast<const uint32_t*>(kr + (kb * 2 + 1) * 16 + dbyte);
       }
+      // bn & 15 keeps the read inside the n16 tile (rows [p*32, p*32+16)) -> within
+      // k_sf_smem, never overrunning into the in-flight v_sf_smem (see tail comment).
+      const uint32_t bn_tail = bn & 15u;
       const uint32_t sfb =
-          *reinterpret_cast<const uint32_t*>(k_sf_smem + (p * 32 + bn) * SF_COLS + kb * 4);
+          *reinterpret_cast<const uint32_t*>(k_sf_smem + (p * 32 + bn_tail) * SF_COLS + kb * 4);
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
         mma_nvf4_m16n8k64<0>(&s_frag[mma_q][2 * p][0], a_frag[mma_q], b[0], b[1], sfa[mma_q], sfb);
