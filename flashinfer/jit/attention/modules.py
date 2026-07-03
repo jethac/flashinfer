@@ -28,6 +28,7 @@ from ..core import (
     logger,
     sm90a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm120f_nvcc_flags,
     current_compilation_context,
 )
 from ...jit.cubin_loader import get_artifact, get_meta_hash
@@ -1414,8 +1415,10 @@ def gen_customize_single_prefill_module(
         extra_cuda_cflags = _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo)
         if use_nvf4_qk:
             # A4Q: the nvf4 block-scaled MMA is sm_120a/121a-specific; compile this
-            # module for sm_120a only and enable the inline-PTX path.
-            extra_cuda_cflags = sm120a_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
+            # module for the sm_120 FAMILY (sm_120f resolves to a cubin that runs on
+            # BOTH sm_120a and sm_121a/GB10 — the arch-specific sm_120a target failed
+            # with "no kernel image" on the Spark) and enable the inline-PTX path.
+            extra_cuda_cflags = sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
         return gen_jit_spec(
             uri,
             source_paths,
@@ -1714,8 +1717,10 @@ def gen_customize_batch_prefill_module(
             extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
         if use_nvf4_qk:
             # A4Q: the nvf4 block-scaled MMA is sm_120a/121a-specific; compile this
-            # module for sm_120a only and enable the inline-PTX path.
-            extra_cuda_cflags = sm120a_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
+            # module for the sm_120 FAMILY (sm_120f resolves to a cubin that runs on
+            # BOTH sm_120a and sm_121a/GB10 — the arch-specific sm_120a target failed
+            # with "no kernel image" on the Spark) and enable the inline-PTX path.
+            extra_cuda_cflags = sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_NVF4_QK_MMA"]
         return gen_jit_spec(
             uri,
             source_paths,
