@@ -230,6 +230,135 @@ __global__ void nvfp4_quant_kernel(const InType* __restrict__ input,
   }
 }
 
+// ---------------------------------------------------------------------------
+// A4Q: precise Q quantization for the nvf4 QK MMA path (no global scale).
+//
+// Semantics match flashinfer.prefill.nvfp4_quantize_q (torch reference)
+// bit-for-bit:
+//   amax16 = max |x| over each 16-elem block, clamped to >= 1e-6
+//   sf     = e4m3(amax16 / 6)          (IEEE RN division, RNE saturating cast)
+//   codes  = cvt.rn.satfinite.e2m1x2(x / float(sf))  (RNE on the e2m1 grid)
+//   sf == 0 (all-tiny block after e4m3 underflow) -> codes forced to 0
+// Notes:
+//  - __fdiv_rn / __fadd_rn are used instead of '/' and '+' because the JIT
+//    compiles with -use_fast_math (which would lower '/' to div.approx and
+//    could elide the -0.0 canonicalizing add under nsz assumptions).
+//  - y + 0.0 canonicalizes -0.0 inputs to +0.0 so the zero code is always
+//    0b0000, matching torch's sign()==0 handling (negative values that merely
+//    ROUND to zero still keep their sign bit in both implementations).
+// One warp per 128 input elements (8 SF blocks); 4 lanes per 16-elem block.
+// ---------------------------------------------------------------------------
+
+// Convert 4 floats into 4 packed e2m1 codes (one uint16, low nibble = even elem).
+inline __device__ uint16_t fp32x4_to_e2m1x4(const float (&y)[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint16_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0, byte1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "mov.b16 %0, {byte0, byte1};\n"
+      "}"
+      : "=h"(val)
+      : "f"(y[0]), "f"(y[1]), "f"(y[2]), "f"(y[3]));
+  return val;
+#else
+  __trap();
+  return 0;
+#endif
+}
+
+template <typename InType>
+__global__ void nvfp4_q_quant_kernel(const InType* __restrict__ input,
+                                     uint8_t* __restrict__ fp4_output,
+                                     uint8_t* __restrict__ block_scales, const int M, const int K) {
+  const int warps_per_block = blockDim.x / 32;
+  const int row = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= M) return;
+  const InType* row_in = input + static_cast<size_t>(row) * K;
+  uint8_t* row_fp4 = fp4_output + static_cast<size_t>(row) * (K / 2);
+  uint8_t* row_sf = block_scales + static_cast<size_t>(row) * (K / NVFP4_BLOCK_SIZE);
+
+  const int blk = lane >> 2;   // 16-elem block within this 128-elem pass
+  const int sub = lane & 3;    // 4-elem sub-chunk within the block
+  for (int base = 0; base < K; base += 128) {
+    const int col = base + blk * 16 + sub * 4;
+    float x[4];
+    if (col < K) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if constexpr (std::is_same_v<InType, __nv_bfloat16>) {
+          x[i] = __bfloat162float(row_in[col + i]);
+        } else {
+          x[i] = __half2float(row_in[col + i]);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) x[i] = 0.f;
+    }
+    float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, 1e-6f);
+    const __nv_fp8_e4m3 sf8(__fdiv_rn(amax, 6.0f));
+    const float sf = static_cast<float>(sf8);
+    uint16_t codes = 0;
+    if (sf != 0.f) {
+      float y[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) y[i] = __fadd_rn(__fdiv_rn(x[i], sf), 0.0f);
+      codes = fp32x4_to_e2m1x4(y);
+    }
+    if (col < K) {
+      *reinterpret_cast<uint16_t*>(row_fp4 + col / 2) = codes;
+      if (sub == 0) row_sf[col / NVFP4_BLOCK_SIZE] = sf8.__x;
+    }
+  }
+}
+
+void nvfp4_q_quant(TensorView input, TensorView fp4_output, TensorView block_scales) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(fp4_output);
+  CHECK_INPUT(block_scales);
+
+  const int M = input.size(0);
+  const int K = input.size(1);
+
+  TVM_FFI_ICHECK(input.ndim() == 2) << "input must be 2D";
+  TVM_FFI_ICHECK(K % NVFP4_BLOCK_SIZE == 0)
+      << "K dimension must be divisible by " << NVFP4_BLOCK_SIZE;
+  TVM_FFI_ICHECK(fp4_output.ndim() == 2) << "fp4_output must be 2D";
+  TVM_FFI_ICHECK(fp4_output.size(0) == M) << "fp4_output row count mismatch";
+  TVM_FFI_ICHECK(fp4_output.size(1) == K / 2) << "fp4_output column count mismatch";
+  TVM_FFI_ICHECK(block_scales.ndim() == 2) << "block_scales must be 2D";
+  TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
+  TVM_FFI_ICHECK(block_scales.size(1) == K / NVFP4_BLOCK_SIZE)
+      << "block_scales column count mismatch";
+  TVM_FFI_ICHECK(fp4_output.device().device_id == input.device().device_id)
+      << "fp4_output must be on the same device as input";
+  TVM_FFI_ICHECK(block_scales.device().device_id == input.device().device_id)
+      << "block_scales must be on the same device as input";
+
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  cudaStream_t stream = get_stream(input.device());
+
+  constexpr int BLOCK_THREADS = 128;
+  constexpr int WARPS_PER_BLOCK = BLOCK_THREADS / 32;
+  dim3 grid((M + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  dim3 block(BLOCK_THREADS);
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    nvfp4_q_quant_kernel<c_type><<<grid, block, 0, stream>>>(
+        static_cast<const c_type*>(input.data_ptr()),
+        static_cast<uint8_t*>(fp4_output.data_ptr()),
+        static_cast<uint8_t*>(block_scales.data_ptr()), M, K);
+    return true;
+  });
+}
+
 void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_output,
                     TensorView block_scales) {
   CHECK_INPUT(input);
@@ -278,3 +407,4 @@ void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_ou
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_kv_quant, nvfp4_kv_quant);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_q_quant, nvfp4_q_quant);

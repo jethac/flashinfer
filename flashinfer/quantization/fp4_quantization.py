@@ -2033,7 +2033,26 @@ def get_fp4_kv_quantization_module():
     ) -> None:
         pass
 
-    return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
+    @register_custom_op(
+        "flashinfer::nvfp4_q_quant",
+        mutates_args=("fp4_output", "block_scales"),
+    )
+    def nvfp4_q_quant(
+        input: torch.Tensor,
+        fp4_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        module.nvfp4_q_quant(input, fp4_output, block_scales)
+
+    @register_fake_op("flashinfer::nvfp4_q_quant")
+    def _fake_nvfp4_q_quant(
+        input: torch.Tensor,
+        fp4_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant, nvfp4_q_quant=nvfp4_q_quant)
 
 
 _NVFP4_BLOCK_SIZE = 16
@@ -2239,3 +2258,50 @@ def nvfp4_kv_quantize(
         input, global_scale, fp4_output, block_scales
     )
     return fp4_output, block_scales
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _nvfp4_quantize_q_cuda_check(q):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_quantize_q_cuda_check)
+@flashinfer_api
+def nvfp4_quantize_q_cuda(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""A4Q: GPU quantization of Q to packed e2m1 codes with per-16 ue4m3 scale
+    factors (linear layout), for the nvf4 QK MMA prefill path.
+
+    Semantics match :func:`flashinfer.prefill.nvfp4_quantize_q` (the torch
+    reference) bit-for-bit: per 16 consecutive elements along the last dim,
+    ``sf = e4m3(amax / 6)`` (amax clamped to >= 1e-6), codes are
+    round-to-nearest-even e2m1 of ``x / float(sf)`` (PTX
+    ``cvt.rn.satfinite.e2m1x2.f32``), packed 2 codes per byte with the low
+    nibble holding the even element. Requires SM100+.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor ``[..., head_dim]`` with dtype bf16 or fp16;
+        ``head_dim`` must be divisible by 16.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(packed, sf)`` with ``packed`` uint8 ``[..., head_dim // 2]`` and
+        ``sf`` uint8 (e4m3 bytes) ``[..., head_dim // 16]``.
+    """
+    shape = q.shape
+    D = shape[-1]
+    if D % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"head_dim ({D}) must be divisible by {_NVFP4_BLOCK_SIZE}"
+        )
+    q2 = q.reshape(-1, D).contiguous()
+    M = q2.size(0)
+    packed = torch.empty((M, D // 2), dtype=torch.uint8, device=q.device)
+    sf = torch.empty((M, D // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=q.device)
+    get_fp4_kv_quantization_module().nvfp4_q_quant(q2, packed, sf)
+    return (
+        packed.reshape(*shape[:-1], D // 2),
+        sf.reshape(*shape[:-1], D // _NVFP4_BLOCK_SIZE),
+    )

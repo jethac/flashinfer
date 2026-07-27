@@ -25,7 +25,7 @@ namespace flashinfer {
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+          typename AttentionVariant, typename Params, bool USE_NVF4_QK = false>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, bool enable_pdl,
                                                    cudaStream_t stream);
@@ -364,7 +364,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+              PagedParams, USE_NVF4_QK>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 
         TVM_FFI_ICHECK(status == cudaSuccess)

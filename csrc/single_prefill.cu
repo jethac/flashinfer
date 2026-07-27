@@ -26,7 +26,7 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+          typename Params, bool USE_NVF4_QK = false>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
@@ -102,8 +102,8 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
 
         cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
             HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-            /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant>(
-            params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
+            /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, Params,
+            USE_NVF4_QK>(params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "SinglePrefillWithKVCache kernel launch failed, error: "
             << cudaGetErrorString(status);
