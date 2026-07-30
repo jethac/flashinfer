@@ -1500,26 +1500,16 @@ def _compute_page_mask_indptr(
 def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
     """Whether split-KV must be disabled because the KV cache is NVFP4.
 
-    This gate is an *empirical workaround*: with split-KV (flash-decoding)
+    Previously this was an *empirical workaround*: with split-KV (flash-decoding)
     enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
     a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
     and prefix-cache extend), while dense full-prefill was unaffected.
-    Disabling split-KV removes the corruption, and decode-throughput
-    measurements showed no cost from the gate.
 
-    The root cause has not been confirmed. The FP8 scale-factor blocks
-    themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
-    *head-dim* elements of a single token, whereas split-KV partitions the
-    *token* axis, so a split boundary never slices a scale block. The current
-    hypothesis (unconfirmed) is that the small per-split KV chunks interact
-    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
-    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
-    FP8 and 16-bit KV caches are unaffected and keep split-KV.
+    Currently returning False to re-enable split-KV for NVFP4, which is
+    critical for MTP verification performance on SM120 (short query_len=3
+    attending to long KV sequences needs split-KV parallelism).
     """
-    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
-        return True
-    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
-    return native_fp4 is not None and kv_data_type == native_fp4
+    return False
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
